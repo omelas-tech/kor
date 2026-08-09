@@ -161,6 +161,39 @@ func TestSDKQueries(t *testing.T) {
 		}
 	})
 
+	t.Run("documentID prefix range scan", func(t *testing.T) {
+		// The Where(DocumentID, ">=", prefix) / "<" prefix+"" pattern
+		// used for per-user cache families like {uid}_{date}_{seq}.
+		pcoll := client.Collection("prefixed")
+		for _, id := range []string{"u1_2026-01-01_0", "u1_2026-01-02_1", "u2_2026-01-01_0"} {
+			if _, err := pcoll.Doc(id).Set(ctx, map[string]any{"v": id}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		got := ids(t, pcoll.
+			Where(firestore.DocumentID, ">=", "u1_").
+			Where(firestore.DocumentID, "<", "u1_").
+			Documents(ctx))
+		if fmt.Sprint(got) != "[u1_2026-01-01_0 u1_2026-01-02_1]" {
+			t.Fatalf("prefix scan = %v", got)
+		}
+		// With an explicit orderBy(DocumentID) + limit, exercising pushdown.
+		got = ids(t, pcoll.
+			Where(firestore.DocumentID, ">=", "u1_").
+			OrderBy(firestore.DocumentID, firestore.Desc).Limit(2).
+			Documents(ctx))
+		if fmt.Sprint(got) != "[u2_2026-01-01_0 u1_2026-01-02_1]" {
+			t.Fatalf("name-ordered scan = %v", got)
+		}
+		// DocumentID 'in' chunks (batched key lookups via query).
+		got = ids(t, pcoll.
+			Where(firestore.DocumentID, "in", []string{"u1_2026-01-01_0", "u2_2026-01-01_0", "missing"}).
+			Documents(ctx))
+		if fmt.Sprint(got) != "[u1_2026-01-01_0 u2_2026-01-01_0]" {
+			t.Fatalf("documentID in = %v", got)
+		}
+	})
+
 	t.Run("collection group", func(t *testing.T) {
 		for _, p := range []string{"p1", "p2"} {
 			if _, err := client.Collection("cgparent").Doc(p).Collection("items").Doc("i").Set(ctx, map[string]any{"p": p}); err != nil {

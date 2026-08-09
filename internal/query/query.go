@@ -97,10 +97,16 @@ func Parse(parent string, sq *pb.StructuredQuery) (*Query, error) {
 	}
 
 	// Implicit ordering: with no explicit orderBy, an inequality field sorts
-	// first (ascending), exactly as Firestore does.
+	// first (ascending), exactly as Firestore does. An inequality on
+	// __name__ needs no extra term — the always-appended name tiebreaker IS
+	// that ordering.
 	if len(q.Order) == 0 {
-		if ineq := firstInequalityField(q.Where); ineq != nil {
-			q.Order = append(q.Order, OrderSpec{Path: ineq, Dir: Asc})
+		if ineq := firstInequalityField(q.Where); ineq != "" && ineq != "__name__" {
+			path, err := value.ParseFieldPath(ineq)
+			if err != nil {
+				return nil, status.Errorf(codes.InvalidArgument, "bad filter field %q: %v", ineq, err)
+			}
+			q.Order = append(q.Order, OrderSpec{Path: path, Dir: Asc})
 			lastDir = Asc
 		}
 	}
@@ -115,6 +121,8 @@ func Parse(parent string, sq *pb.StructuredQuery) (*Query, error) {
 	if c := sq.GetEndAt(); c != nil {
 		q.End = &Cursor{Values: c.GetValues(), Before: c.GetBefore()}
 	}
+
+	canonicalizeNameOperands(q)
 
 	if p := sq.GetSelect(); p != nil {
 		fields := p.GetFields()
@@ -136,13 +144,66 @@ func Parse(parent string, sq *pb.StructuredQuery) (*Query, error) {
 	return q, nil
 }
 
-// firstInequalityField returns the field path of the first range/not-equal
-// filter in the tree, or nil.
-func firstInequalityField(f *pb.StructuredQuery_Filter) value.FieldPath {
+// canonicalizeNameOperands rewrites string operands of __name__ filters and
+// cursors into full document references. SDKs (the Go client among them)
+// send Where(DocumentID, op, "docid") with a bare string_value; the backend
+// resolves it relative to the query target. Collection-group queries resolve
+// relative to the parent instead (the string then carries the full relative
+// path).
+func canonicalizeNameOperands(q *Query) {
+	base := q.Parent
+	if !q.AllDescendants {
+		base = q.Parent + "/" + q.CollectionID
+	}
+	toRef := func(v *pb.Value) *pb.Value {
+		if s, ok := v.GetValueType().(*pb.Value_StringValue); ok {
+			return &pb.Value{ValueType: &pb.Value_ReferenceValue{ReferenceValue: base + "/" + s.StringValue}}
+		}
+		return v
+	}
+	var walk func(f *pb.StructuredQuery_Filter)
+	walk = func(f *pb.StructuredQuery_Filter) {
+		switch t := f.GetFilterType().(type) {
+		case *pb.StructuredQuery_Filter_CompositeFilter:
+			for _, sub := range t.CompositeFilter.GetFilters() {
+				walk(sub)
+			}
+		case *pb.StructuredQuery_Filter_FieldFilter:
+			ff := t.FieldFilter
+			if ff.GetField().GetFieldPath() != "__name__" || ff.Value == nil {
+				return
+			}
+			if arr, ok := ff.Value.GetValueType().(*pb.Value_ArrayValue); ok {
+				for i, el := range arr.ArrayValue.GetValues() {
+					arr.ArrayValue.Values[i] = toRef(el)
+				}
+				return
+			}
+			ff.Value = toRef(ff.Value)
+		}
+	}
+	if q.Where != nil {
+		walk(q.Where)
+	}
+	for _, cur := range []*Cursor{q.Start, q.End} {
+		if cur == nil {
+			continue
+		}
+		for i, v := range cur.Values {
+			if i < len(q.Order) && q.Order[i].IsName {
+				cur.Values[i] = toRef(v)
+			}
+		}
+	}
+}
+
+// firstInequalityField returns the raw field path of the first
+// range/not-equal filter in the tree, or "".
+func firstInequalityField(f *pb.StructuredQuery_Filter) string {
 	switch t := f.GetFilterType().(type) {
 	case *pb.StructuredQuery_Filter_CompositeFilter:
 		for _, sub := range t.CompositeFilter.GetFilters() {
-			if p := firstInequalityField(sub); p != nil {
+			if p := firstInequalityField(sub); p != "" {
 				return p
 			}
 		}
@@ -154,19 +215,15 @@ func firstInequalityField(f *pb.StructuredQuery_Filter) value.FieldPath {
 			pb.StructuredQuery_FieldFilter_GREATER_THAN_OR_EQUAL,
 			pb.StructuredQuery_FieldFilter_NOT_EQUAL,
 			pb.StructuredQuery_FieldFilter_NOT_IN:
-			if p, err := value.ParseFieldPath(t.FieldFilter.GetField().GetFieldPath()); err == nil {
-				return p
-			}
+			return t.FieldFilter.GetField().GetFieldPath()
 		}
 	case *pb.StructuredQuery_Filter_UnaryFilter:
 		switch t.UnaryFilter.GetOp() {
 		case pb.StructuredQuery_UnaryFilter_IS_NOT_NAN, pb.StructuredQuery_UnaryFilter_IS_NOT_NULL:
-			if p, err := value.ParseFieldPath(t.UnaryFilter.GetField().GetFieldPath()); err == nil {
-				return p
-			}
+			return t.UnaryFilter.GetField().GetFieldPath()
 		}
 	}
-	return nil
+	return ""
 }
 
 // Matches reports whether a document satisfies the query's filters AND has
@@ -184,15 +241,15 @@ func (q *Query) Matches(name string, fields map[string]*pb.Value) bool {
 	if q.Where == nil {
 		return true
 	}
-	return evalFilter(q.Where, fields)
+	return evalFilter(q.Where, name, fields)
 }
 
-func evalFilter(f *pb.StructuredQuery_Filter, fields map[string]*pb.Value) bool {
+func evalFilter(f *pb.StructuredQuery_Filter, name string, fields map[string]*pb.Value) bool {
 	switch t := f.GetFilterType().(type) {
 	case *pb.StructuredQuery_Filter_CompositeFilter:
 		isOr := t.CompositeFilter.GetOp() == pb.StructuredQuery_CompositeFilter_OR
 		for _, sub := range t.CompositeFilter.GetFilters() {
-			ok := evalFilter(sub, fields)
+			ok := evalFilter(sub, name, fields)
 			if isOr && ok {
 				return true
 			}
@@ -202,7 +259,7 @@ func evalFilter(f *pb.StructuredQuery_Filter, fields map[string]*pb.Value) bool 
 		}
 		return !isOr
 	case *pb.StructuredQuery_Filter_FieldFilter:
-		return evalFieldFilter(t.FieldFilter, fields)
+		return evalFieldFilter(t.FieldFilter, name, fields)
 	case *pb.StructuredQuery_Filter_UnaryFilter:
 		return evalUnaryFilter(t.UnaryFilter, fields)
 	default:
@@ -233,14 +290,22 @@ func evalUnaryFilter(u *pb.StructuredQuery_UnaryFilter, fields map[string]*pb.Va
 	return false
 }
 
-func evalFieldFilter(ff *pb.StructuredQuery_FieldFilter, fields map[string]*pb.Value) bool {
-	path, err := value.ParseFieldPath(ff.GetField().GetFieldPath())
-	if err != nil {
-		return false
-	}
-	v, ok := value.GetField(fields, path)
-	if !ok {
-		return false // missing fields never match any field filter
+func evalFieldFilter(ff *pb.StructuredQuery_FieldFilter, name string, fields map[string]*pb.Value) bool {
+	var v *pb.Value
+	if ff.GetField().GetFieldPath() == "__name__" {
+		// The document-key pseudo-field: compares as a reference, which the
+		// SDKs also use for Where(DocumentID, ...) prefix range scans.
+		v = &pb.Value{ValueType: &pb.Value_ReferenceValue{ReferenceValue: name}}
+	} else {
+		path, err := value.ParseFieldPath(ff.GetField().GetFieldPath())
+		if err != nil {
+			return false
+		}
+		var ok bool
+		v, ok = value.GetField(fields, path)
+		if !ok {
+			return false // missing fields never match any field filter
+		}
 	}
 	op := ff.GetOp()
 	operand := ff.GetValue()

@@ -243,6 +243,9 @@ func containmentProbes(f *pb.StructuredQuery_Filter) ([][][]byte, bool) {
 		}
 	case *pb.StructuredQuery_Filter_FieldFilter:
 		ff := t.FieldFilter
+		if ff.GetField().GetFieldPath() == "__name__" {
+			return out, true // pseudo-field: not a data field, no containment probe
+		}
 		path, err := value.ParseFieldPath(ff.GetField().GetFieldPath())
 		if err != nil {
 			return out, true

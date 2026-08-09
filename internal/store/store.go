@@ -25,6 +25,7 @@ var migrationsFS embed.FS
 // Store wraps a Postgres pool holding Kor's document data.
 type Store struct {
 	Pool *pgxpool.Pool
+	txns txnRegistry
 }
 
 // Doc is a stored document.
@@ -177,6 +178,13 @@ func scanDocs(rows pgx.Rows) (map[string]*Doc, error) {
 // observe the effects of earlier ones (required by SDKs that pair an update
 // with a separate transform write for the same document).
 func (s *Store) Commit(ctx context.Context, ws []*pb.Write) ([]*pb.WriteResult, time.Time, error) {
+	return s.applyCommit(ctx, ws, nil, nil)
+}
+
+// applyCommit is the shared core of Commit and CommitTxn: lock the union of
+// write targets and extraLocks in canonical order, verify recorded read
+// versions (ABORTED on drift), apply writes, persist.
+func (s *Store) applyCommit(ctx context.Context, ws []*pb.Write, extraLocks []string, verify map[string]time.Time) ([]*pb.WriteResult, time.Time, error) {
 	commitTime := time.Now().UTC().Truncate(time.Microsecond)
 
 	// Collect and lock target documents in canonical order (deadlock safety).
@@ -196,7 +204,14 @@ func (s *Store) Commit(ctx context.Context, ws []*pb.Write) ([]*pb.WriteResult, 
 			targets = append(targets, name)
 		}
 	}
+	lockSet := append([]string(nil), targets...)
+	for _, name := range extraLocks {
+		if _, isTarget := paths[name]; !isTarget {
+			lockSet = append(lockSet, name)
+		}
+	}
 	sort.Strings(targets)
+	sort.Strings(lockSet)
 
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
@@ -204,15 +219,39 @@ func (s *Store) Commit(ctx context.Context, ws []*pb.Write) ([]*pb.WriteResult, 
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	// Row locks (FOR UPDATE) cannot cover documents that do not exist yet, so
+	// concurrent creates of the same name would race past version checks and
+	// preconditions. Transaction-scoped advisory locks on the (sorted) name
+	// set serialize commits touching the same documents, present or not.
+	if len(lockSet) > 0 {
+		if _, err := tx.Exec(ctx,
+			`SELECT pg_advisory_xact_lock(hashtext(n)) FROM unnest($1::text[]) AS n`, lockSet); err != nil {
+			return nil, time.Time{}, fmt.Errorf("store: advisory locks: %w", err)
+		}
+	}
+
 	states := map[string]*writes.DocState{}
 	rows, err := tx.Query(ctx,
-		`SELECT name, data, create_time, update_time FROM documents WHERE name = ANY($1) FOR UPDATE`, targets)
+		`SELECT name, data, create_time, update_time FROM documents WHERE name = ANY($1) FOR UPDATE`, lockSet)
 	if err != nil {
 		return nil, time.Time{}, fmt.Errorf("store: lock documents: %w", err)
 	}
 	existing, err := scanDocs(rows)
 	if err != nil {
 		return nil, time.Time{}, err
+	}
+
+	// Optimistic-transaction validation: every read version must be unchanged
+	// between the transactional read and this commit.
+	for name, want := range verify {
+		var current time.Time
+		if doc, ok := existing[name]; ok {
+			current = doc.UpdateTime
+		}
+		if !current.Equal(want) {
+			return nil, time.Time{}, status.Errorf(codes.Aborted,
+				"transaction contention on %s: read version %v, current %v", name, want, current)
+		}
 	}
 	for _, name := range targets {
 		if doc, ok := existing[name]; ok {

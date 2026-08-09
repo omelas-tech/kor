@@ -51,12 +51,25 @@ codebase against Kor's change-log.
 
 ## Status: early, honest alpha
 
-Working today (verified by tests against the real Go SDK):
+Working today (verified by tests against the real Go SDK — and by a
+production application's full API test suite passing against Kor unchanged):
 
 - Documents: create / set / merge (`MergeAll`) / update with field masks /
   delete, preconditions (`exists`, `update_time`) with correct error codes
 - Field transforms: `serverTimestamp`, `increment` (saturating, mixed
   int/double), `maximum`/`minimum`, `arrayUnion`, `arrayRemove`
+- **Structured queries** (`RunQuery`): all filter operators (`==`, ranges
+  with Firestore's type-bucket semantics, `!=`, `in`/`not-in`,
+  `array-contains[-any]`, unary null/NaN filters, AND/OR composites),
+  Firestore-exact ordering rules (implicit inequality ordering, `__name__`
+  tiebreaker, missing-orderBy-field exclusion), cursors
+  (`startAt/After`, `endAt/Before`, snapshot cursors), offset/limit,
+  projections and keys-only, collection-group queries
+- **`count()` aggregations** (with `up_to`)
+- **Optimistic transactions**: `BeginTransaction`/`Commit`/`Rollback` with
+  read-version verification at commit under row + advisory locks — exact
+  under contention, including concurrent create-if-absent races; conflicts
+  return `ABORTED` so SDK `RunTransaction` retries transparently
 - `Commit`, `BatchWrite`, `BatchGetDocuments`, `GetDocument`,
   `ListCollectionIds`
 - Full Firestore type fidelity through PostgreSQL jsonb: int64 beyond 2^53,
@@ -66,11 +79,17 @@ Working today (verified by tests against the real Go SDK):
   cross-type ordering (the foundation for composite indexes), fuzz-verified
   against a reference comparator
 
+Query execution note: Postgres narrows candidates (collection bounds, jsonb
+containment, `__name__`-ordered scans with cursor/limit pushdown) and full
+Firestore semantics are re-evaluated in Go. Composite `index_entries`
+execution for large hot query shapes is the next performance step — the
+semantics above are the reference implementation it must match.
+
 On the roadmap (in build order):
 
 | Phase | Scope |
 |---|---|
-| 1 | Queries (`RunQuery`), count aggregations, composite indexes, transactions |
+| 1 (remaining) | Composite `index_entries` execution for hot query shapes; differential fuzzing vs the Google emulator |
 | 2 | Change-log + functions runtime (runs `firebase-functions` v2 code unchanged) + cron scheduler |
 | 3 | Realtime: `Listen`/`Write` streams for the native mobile SDKs |
 | 4 | Security rules interpreter (`firestore.rules` verbatim) + Firebase Auth token verification |

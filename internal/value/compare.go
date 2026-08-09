@@ -34,6 +34,16 @@ func IsNumeric(v *pb.Value) bool {
 	return o == orderNumber || o == orderNaN
 }
 
+// IsNull reports whether v is the null value.
+func IsNull(v *pb.Value) bool {
+	return TypeOrder(v) == orderNull
+}
+
+// IsNaN reports whether v is a NaN double.
+func IsNaN(v *pb.Value) bool {
+	return TypeOrder(v) == orderNaN
+}
+
 // TypeOrder returns the ordering bucket for a value.
 func TypeOrder(v *pb.Value) int {
 	switch t := v.GetValueType().(type) {

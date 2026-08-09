@@ -12,8 +12,10 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/emptypb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"github.com/omelas-tech/kor/internal/query"
 	"github.com/omelas-tech/kor/internal/store"
 )
 
@@ -33,12 +35,19 @@ func (s *Server) Register(g *grpc.Server) {
 	pb.RegisterFirestoreServer(g, s)
 }
 
-// Commit applies writes atomically.
+// Commit applies writes atomically, optionally as a transaction commit with
+// read-version verification.
 func (s *Server) Commit(ctx context.Context, req *pb.CommitRequest) (*pb.CommitResponse, error) {
-	if req.GetTransaction() != nil {
-		return nil, status.Error(codes.Unimplemented, "kor: transactions not implemented yet")
+	var (
+		results    []*pb.WriteResult
+		commitTime time.Time
+		err        error
+	)
+	if txn := req.GetTransaction(); len(txn) > 0 {
+		results, commitTime, err = s.store.CommitTxn(ctx, txn, req.GetWrites())
+	} else {
+		results, commitTime, err = s.store.Commit(ctx, req.GetWrites())
 	}
-	results, commitTime, err := s.store.Commit(ctx, req.GetWrites())
 	if err != nil {
 		return nil, err
 	}
@@ -46,6 +55,87 @@ func (s *Server) Commit(ctx context.Context, req *pb.CommitRequest) (*pb.CommitR
 		WriteResults: results,
 		CommitTime:   timestamppb.New(commitTime),
 	}, nil
+}
+
+// BeginTransaction starts an optimistic transaction.
+func (s *Server) BeginTransaction(ctx context.Context, req *pb.BeginTransactionRequest) (*pb.BeginTransactionResponse, error) {
+	return &pb.BeginTransactionResponse{Transaction: s.store.BeginTxn()}, nil
+}
+
+// Rollback discards a transaction.
+func (s *Server) Rollback(ctx context.Context, req *pb.RollbackRequest) (*emptypb.Empty, error) {
+	s.store.RollbackTxn(req.GetTransaction())
+	return &emptypb.Empty{}, nil
+}
+
+// RunQuery executes a structured query and streams results.
+func (s *Server) RunQuery(req *pb.RunQueryRequest, stream pb.Firestore_RunQueryServer) error {
+	if req.GetTransaction() != nil || req.GetNewTransaction() != nil || req.GetReadTime() != nil {
+		// Point-read transactions only, by design — see internal/store/txn.go.
+		return status.Error(codes.Unimplemented, "kor: queries inside transactions are not supported")
+	}
+	q, err := query.Parse(req.GetParent(), req.GetStructuredQuery())
+	if err != nil {
+		return err
+	}
+	readTime := timestamppb.New(time.Now().UTC().Truncate(time.Microsecond))
+	sent := 0
+	err = s.store.RunQuery(stream.Context(), q, func(doc *store.Doc) error {
+		d, err := docProto(doc)
+		if err != nil {
+			return err
+		}
+		d.Fields = q.ApplyProjection(d.Fields)
+		sent++
+		return stream.Send(&pb.RunQueryResponse{Document: d, ReadTime: readTime})
+	})
+	if err != nil {
+		return err
+	}
+	if sent == 0 {
+		// Empty result: a document-less response carries the read time.
+		return stream.Send(&pb.RunQueryResponse{ReadTime: readTime})
+	}
+	return nil
+}
+
+// RunAggregationQuery supports count() (with up_to); sum/avg return
+// UNIMPLEMENTED until a consumer exists.
+func (s *Server) RunAggregationQuery(req *pb.RunAggregationQueryRequest, stream pb.Firestore_RunAggregationQueryServer) error {
+	if req.GetTransaction() != nil || req.GetNewTransaction() != nil || req.GetReadTime() != nil {
+		return status.Error(codes.Unimplemented, "kor: aggregations inside transactions are not supported")
+	}
+	saq := req.GetStructuredAggregationQuery()
+	q, err := query.Parse(req.GetParent(), saq.GetStructuredQuery())
+	if err != nil {
+		return err
+	}
+	var upTo int64
+	aliases := make([]string, 0, len(saq.GetAggregations()))
+	for _, agg := range saq.GetAggregations() {
+		c, ok := agg.GetOperator().(*pb.StructuredAggregationQuery_Aggregation_Count_)
+		if !ok {
+			return status.Error(codes.Unimplemented, "kor: only count() aggregations are implemented")
+		}
+		aliases = append(aliases, agg.GetAlias())
+		if v := c.Count.GetUpTo(); v != nil {
+			if upTo == 0 || v.GetValue() > upTo {
+				upTo = v.GetValue()
+			}
+		}
+	}
+	n, err := s.store.RunCount(stream.Context(), q, upTo)
+	if err != nil {
+		return err
+	}
+	fields := map[string]*pb.Value{}
+	for _, alias := range aliases {
+		fields[alias] = &pb.Value{ValueType: &pb.Value_IntegerValue{IntegerValue: n}}
+	}
+	return stream.Send(&pb.RunAggregationQueryResponse{
+		Result:   &pb.AggregationResult{AggregateFields: fields},
+		ReadTime: timestamppb.New(time.Now().UTC().Truncate(time.Microsecond)),
+	})
 }
 
 // BatchWrite applies writes non-atomically, returning a status per write.
@@ -69,32 +159,69 @@ func (s *Server) BatchWrite(ctx context.Context, req *pb.BatchWriteRequest) (*pb
 // GetDocument returns a single document (REST-oriented; server SDKs use
 // BatchGetDocuments).
 func (s *Server) GetDocument(ctx context.Context, req *pb.GetDocumentRequest) (*pb.Document, error) {
-	if req.GetTransaction() != nil || req.GetReadTime() != nil {
-		return nil, status.Error(codes.Unimplemented, "kor: read consistency selectors not implemented yet")
+	if req.GetReadTime() != nil {
+		return nil, status.Error(codes.Unimplemented, "kor: read-time reads not implemented yet")
 	}
 	docs, err := s.store.GetDocuments(ctx, []string{req.GetName()})
 	if err != nil {
 		return nil, err
 	}
 	doc, ok := docs[req.GetName()]
+	if txn := req.GetTransaction(); len(txn) > 0 {
+		var readAt time.Time // zero records "missing at read time"
+		if ok {
+			readAt = doc.UpdateTime
+		}
+		if err := s.store.RecordTxnReads(txn, map[string]time.Time{req.GetName(): readAt}); err != nil {
+			return nil, err
+		}
+	}
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "document not found: %s", req.GetName())
 	}
 	return docProto(doc)
 }
 
-// BatchGetDocuments streams found/missing results for the requested names.
+// BatchGetDocuments streams found/missing results for the requested names,
+// recording read versions when a transaction is attached.
 func (s *Server) BatchGetDocuments(req *pb.BatchGetDocumentsRequest, stream pb.Firestore_BatchGetDocumentsServer) error {
-	if req.GetTransaction() != nil || req.GetNewTransaction() != nil || req.GetReadTime() != nil {
-		return status.Error(codes.Unimplemented, "kor: read consistency selectors not implemented yet")
+	if req.GetReadTime() != nil {
+		return status.Error(codes.Unimplemented, "kor: read-time reads not implemented yet")
 	}
+	txnID := req.GetTransaction()
+	var newTxn []byte
+	if req.GetNewTransaction() != nil {
+		newTxn = s.store.BeginTxn()
+		txnID = newTxn
+	}
+
 	docs, err := s.store.GetDocuments(stream.Context(), req.GetDocuments())
 	if err != nil {
 		return err
 	}
+
+	if len(txnID) > 0 {
+		reads := make(map[string]time.Time, len(req.GetDocuments()))
+		for _, name := range req.GetDocuments() {
+			var readAt time.Time // zero = missing at read time
+			if doc, ok := docs[name]; ok {
+				readAt = doc.UpdateTime
+			}
+			reads[name] = readAt
+		}
+		if err := s.store.RecordTxnReads(txnID, reads); err != nil {
+			return err
+		}
+	}
+
 	readTime := timestamppb.New(time.Now().UTC().Truncate(time.Microsecond))
+	first := true
 	for _, name := range req.GetDocuments() {
 		resp := &pb.BatchGetDocumentsResponse{ReadTime: readTime}
+		if first {
+			resp.Transaction = newTxn
+			first = false
+		}
 		if doc, ok := docs[name]; ok {
 			d, err := docProto(doc)
 			if err != nil {

@@ -1,0 +1,303 @@
+package e2e
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"testing"
+
+	"cloud.google.com/go/firestore"
+	"google.golang.org/api/iterator"
+)
+
+func seedQueryDocs(t *testing.T, client *firestore.Client) *firestore.CollectionRef {
+	t.Helper()
+	ctx := context.Background()
+	coll := client.Collection("q")
+	docs := map[string]map[string]any{
+		"a": {"n": int64(1), "s": "alpha", "tags": []any{"x", "y"}, "group": "g1", "mix": int64(7)},
+		"b": {"n": int64(2), "s": "beta", "tags": []any{"y"}, "group": "g1", "mix": "text"},
+		"c": {"n": int64(3), "s": "gamma", "group": "g2", "mix": nil},
+		"d": {"s": "delta", "group": "g2"}, // no "n": excluded by orderBy(n)
+	}
+	for id, data := range docs {
+		if _, err := coll.Doc(id).Set(ctx, data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return coll
+}
+
+func ids(t *testing.T, it *firestore.DocumentIterator) []string {
+	t.Helper()
+	var out []string
+	for {
+		snap, err := it.Next()
+		if err == iterator.Done {
+			return out
+		}
+		if err != nil {
+			t.Fatalf("iterate: %v", err)
+		}
+		out = append(out, snap.Ref.ID)
+	}
+}
+
+func TestSDKQueries(t *testing.T) {
+	startKord(t)
+	client := newClient(t)
+	ctx := context.Background()
+	coll := seedQueryDocs(t, client)
+
+	t.Run("range with type-bucket exclusion", func(t *testing.T) {
+		// mix > 0 must match only the numeric mix, never the string or null.
+		got := ids(t, coll.Where("mix", ">", 0).Documents(ctx))
+		if len(got) != 1 || got[0] != "a" {
+			t.Fatalf("mix>0 = %v, want [a]", got)
+		}
+	})
+
+	t.Run("equality and chained filters", func(t *testing.T) {
+		got := ids(t, coll.Where("group", "==", "g1").Where("n", ">=", 2).Documents(ctx))
+		if len(got) != 1 || got[0] != "b" {
+			t.Fatalf("got %v, want [b]", got)
+		}
+	})
+
+	t.Run("in and not-equal", func(t *testing.T) {
+		got := ids(t, coll.Where("s", "in", []any{"alpha", "gamma"}).OrderBy("s", firestore.Asc).Documents(ctx))
+		if fmt.Sprint(got) != "[a c]" {
+			t.Fatalf("in = %v", got)
+		}
+		// != excludes null mix (c) and matches only existing non-equal values.
+		got = ids(t, coll.Where("mix", "!=", "text").Documents(ctx))
+		if len(got) != 1 || got[0] != "a" {
+			t.Fatalf("mix != text = %v, want [a]", got)
+		}
+	})
+
+	t.Run("array-contains and any", func(t *testing.T) {
+		got := ids(t, coll.Where("tags", "array-contains", "x").Documents(ctx))
+		if len(got) != 1 || got[0] != "a" {
+			t.Fatalf("array-contains = %v", got)
+		}
+		got = ids(t, coll.Where("tags", "array-contains-any", []any{"y", "zz"}).OrderBy(firestore.DocumentID, firestore.Asc).Documents(ctx))
+		if fmt.Sprint(got) != "[a b]" {
+			t.Fatalf("array-contains-any = %v", got)
+		}
+	})
+
+	t.Run("order limit and missing-field exclusion", func(t *testing.T) {
+		got := ids(t, coll.OrderBy("n", firestore.Desc).Documents(ctx))
+		if fmt.Sprint(got) != "[c b a]" { // d has no n → excluded
+			t.Fatalf("orderBy n desc = %v", got)
+		}
+		got = ids(t, coll.OrderBy("n", firestore.Desc).Limit(2).Documents(ctx))
+		if fmt.Sprint(got) != "[c b]" {
+			t.Fatalf("limit = %v", got)
+		}
+	})
+
+	t.Run("snapshot cursor StartAfter", func(t *testing.T) {
+		snap, err := coll.Doc("c").Get(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := ids(t, coll.OrderBy("n", firestore.Desc).StartAfter(snap).Documents(ctx))
+		if fmt.Sprint(got) != "[b a]" {
+			t.Fatalf("startAfter(snapshot) = %v", got)
+		}
+	})
+
+	t.Run("value cursors and offset", func(t *testing.T) {
+		got := ids(t, coll.OrderBy("n", firestore.Asc).StartAt(2).EndBefore(3).Documents(ctx))
+		if fmt.Sprint(got) != "[b]" {
+			t.Fatalf("startAt/endBefore = %v", got)
+		}
+		got = ids(t, coll.OrderBy("n", firestore.Asc).Offset(1).Limit(1).Documents(ctx))
+		if fmt.Sprint(got) != "[b]" {
+			t.Fatalf("offset/limit = %v", got)
+		}
+	})
+
+	t.Run("limitToLast", func(t *testing.T) {
+		snaps, err := coll.OrderBy("n", firestore.Asc).LimitToLast(2).Documents(ctx).GetAll()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got []string
+		for _, s := range snaps {
+			got = append(got, s.Ref.ID)
+		}
+		if fmt.Sprint(got) != "[b c]" {
+			t.Fatalf("limitToLast = %v", got)
+		}
+	})
+
+	t.Run("projection and keys-only", func(t *testing.T) {
+		it := coll.Where("s", "==", "alpha").Select("s").Documents(ctx)
+		snap, err := it.Next()
+		if err != nil {
+			t.Fatal(err)
+		}
+		data := snap.Data()
+		if len(data) != 1 || data["s"] != "alpha" {
+			t.Fatalf("projection = %v", data)
+		}
+		it = coll.Where("s", "==", "alpha").Select().Documents(ctx)
+		snap, err = it.Next()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(snap.Data()) != 0 || snap.Ref.ID != "a" {
+			t.Fatalf("keys-only = %v (%s)", snap.Data(), snap.Ref.ID)
+		}
+	})
+
+	t.Run("empty result", func(t *testing.T) {
+		got := ids(t, coll.Where("s", "==", "nope").Documents(ctx))
+		if len(got) != 0 {
+			t.Fatalf("want empty, got %v", got)
+		}
+	})
+
+	t.Run("collection group", func(t *testing.T) {
+		for _, p := range []string{"p1", "p2"} {
+			if _, err := client.Collection("cgparent").Doc(p).Collection("items").Doc("i").Set(ctx, map[string]any{"p": p}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		got := ids(t, client.CollectionGroup("items").Documents(ctx))
+		if len(got) != 2 {
+			t.Fatalf("collection group = %v", got)
+		}
+		got = ids(t, client.CollectionGroup("items").Where("p", "==", "p2").Documents(ctx))
+		if len(got) != 1 {
+			t.Fatalf("filtered collection group = %v", got)
+		}
+	})
+
+	t.Run("count aggregation", func(t *testing.T) {
+		all := coll.Query
+		res, err := all.NewAggregationQuery().WithCount("total").Get(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n := countOf(t, res, "total"); n != 4 {
+			t.Fatalf("count = %d, want 4", n)
+		}
+		filtered := coll.Where("group", "==", "g1")
+		res, err = filtered.NewAggregationQuery().WithCount("total").Get(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n := countOf(t, res, "total"); n != 2 {
+			t.Fatalf("filtered count = %d, want 2", n)
+		}
+	})
+}
+
+func countOf(t *testing.T, res firestore.AggregationResult, alias string) int64 {
+	t.Helper()
+	v, ok := res[alias]
+	if !ok {
+		t.Fatalf("aggregation result missing alias %q: %v", alias, res)
+	}
+	pbVal, ok := v.(interface{ GetIntegerValue() int64 })
+	if !ok {
+		t.Fatalf("aggregation value has unexpected type %T", v)
+	}
+	return pbVal.GetIntegerValue()
+}
+
+func TestSDKTransactions(t *testing.T) {
+	startKord(t)
+	client := newClient(t)
+	ctx := context.Background()
+
+	t.Run("contended increments are exact", func(t *testing.T) {
+		ref := client.Collection("txn").Doc("counter")
+		if _, err := ref.Set(ctx, map[string]any{"count": int64(0)}); err != nil {
+			t.Fatal(err)
+		}
+		const workers = 20
+		var wg sync.WaitGroup
+		errs := make(chan error, workers)
+		for i := 0; i < workers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				errs <- client.RunTransaction(ctx, func(ctx context.Context, tx *firestore.Transaction) error {
+					snap, err := tx.Get(ref)
+					if err != nil {
+						return err
+					}
+					n, _ := snap.Data()["count"].(int64)
+					return tx.Set(ref, map[string]any{"count": n + 1})
+				})
+			}()
+		}
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			if err != nil {
+				t.Fatalf("transaction failed: %v", err)
+			}
+		}
+		snap, _ := ref.Get(ctx)
+		if got := snap.Data()["count"]; got != int64(workers) {
+			t.Fatalf("count = %v, want %d (lost updates!)", got, workers)
+		}
+	})
+
+	t.Run("create-if-absent races resolve exactly once", func(t *testing.T) {
+		ref := client.Collection("txn").Doc("create-race")
+		const workers = 5
+		var wg sync.WaitGroup
+		errs := make(chan error, workers)
+		for i := 0; i < workers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				errs <- client.RunTransaction(ctx, func(ctx context.Context, tx *firestore.Transaction) error {
+					snap, err := tx.Get(ref)
+					if err != nil && !snap.Exists() {
+						// Missing: first writer creates with count 1. The read
+						// of the missing doc must still be version-checked.
+						return tx.Set(ref, map[string]any{"count": int64(1)})
+					}
+					if err != nil {
+						return err
+					}
+					n, _ := snap.Data()["count"].(int64)
+					return tx.Set(ref, map[string]any{"count": n + 1})
+				})
+			}()
+		}
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			if err != nil {
+				t.Fatalf("transaction failed: %v", err)
+			}
+		}
+		snap, _ := ref.Get(ctx)
+		if got := snap.Data()["count"]; got != int64(workers) {
+			t.Fatalf("count = %v, want %d (create race mishandled)", got, workers)
+		}
+	})
+
+	t.Run("read-only transaction validates", func(t *testing.T) {
+		ref := client.Collection("txn").Doc("ro")
+		if _, err := ref.Set(ctx, map[string]any{"v": int64(1)}); err != nil {
+			t.Fatal(err)
+		}
+		err := client.RunTransaction(ctx, func(ctx context.Context, tx *firestore.Transaction) error {
+			_, err := tx.Get(ref)
+			return err
+		})
+		if err != nil {
+			t.Fatalf("read-only transaction: %v", err)
+		}
+	})
+}

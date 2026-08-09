@@ -1,0 +1,6 @@
+/kord
+/kor
+*.test
+*.out
+.DS_Store
+/dist/

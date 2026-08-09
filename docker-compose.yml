@@ -1,0 +1,36 @@
+# Kor quick start: a Firestore-compatible server on PostgreSQL.
+#
+#   docker compose up
+#   FIRESTORE_EMULATOR_HOST=localhost:6565 ./your-existing-app
+#
+# Data persists in the `kor-pgdata` volume. This compose file is for local
+# use — kord has no auth; do not publish port 6565 beyond localhost.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: kor
+      POSTGRES_PASSWORD: kor
+      POSTGRES_DB: kor
+    volumes:
+      - kor-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kor -d kor"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  kord:
+    build: .
+    environment:
+      KORD_PG_DSN: postgres://kor:kor@postgres:5432/kor
+      KORD_LISTEN: 0.0.0.0:6565
+      KORD_LOG: info
+    ports:
+      - "127.0.0.1:6565:6565"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  kor-pgdata:

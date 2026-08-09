@@ -180,6 +180,24 @@ func (s *Store) runGeneral(ctx context.Context, q *query.Query, where string, ar
 
 // RunCount executes the query counting matches, honoring limit and upTo.
 func (s *Store) RunCount(ctx context.Context, q *query.Query, upTo int64) (int64, error) {
+	// Filter-less, cursor-less counts (the "how many documents in this
+	// collection" shape) reduce exactly to SQL count(*) — no need to stream
+	// and decode every document.
+	if q.Where == nil && q.Start == nil && q.End == nil && q.Offset == 0 {
+		where, args := s.baseConditions(q)
+		var n int64
+		if err := s.Pool.QueryRow(ctx, `SELECT count(*) FROM documents WHERE `+where, args...).Scan(&n); err != nil {
+			return 0, fmt.Errorf("store: count: %w", err)
+		}
+		if q.Limit >= 0 && n > int64(q.Limit) {
+			n = int64(q.Limit)
+		}
+		if upTo > 0 && n > upTo {
+			n = upTo
+		}
+		return n, nil
+	}
+
 	bounded := *q
 	if upTo > 0 && (bounded.Limit < 0 || upTo < int64(bounded.Limit)) {
 		bounded.Limit = int32(upTo)

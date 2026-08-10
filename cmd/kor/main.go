@@ -283,6 +283,7 @@ func runImport(args []string) {
 	fs.StringVar(&cf.creds, "creds", os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"), "service account JSON for the source project")
 	resumeAfter := fs.String("resume-after", "", "resume after this document id (overrides state file)")
 	stateFile := fs.String("state", "", "path to a cursor state file (written per batch, read on start)")
+	idsFile := fs.String("ids", "", "targeted sync: copy only the doc ids listed in this file (one per line)")
 	_ = fs.Parse(args)
 	if cf.collection == "" || cf.project == "" {
 		fs.Usage()
@@ -294,6 +295,11 @@ func runImport(args []string) {
 	defer src.Close()
 	dst := korClient(ctx, cf)
 	defer dst.Close()
+
+	if *idsFile != "" {
+		importIDs(ctx, cf, src, dst, *idsFile)
+		return
+	}
 
 	cursor := *resumeAfter
 	if cursor == "" && *stateFile != "" {
@@ -347,6 +353,51 @@ func runImport(args []string) {
 	}
 	log.Printf("DONE: imported %d docs from %s/%s in %s (source scanned %d)",
 		imported, cf.project, cf.collection, time.Since(start).Round(time.Second), total)
+}
+
+// importIDs copies an explicit id list source→kor (targeted sync after an
+// out-of-band batch wrote to the source store).
+func importIDs(ctx context.Context, cf copyFlags, src, dst *firestore.Client, idsFile string) {
+	raw, err := os.ReadFile(idsFile)
+	if err != nil {
+		log.Fatalf("read ids file: %v", err)
+	}
+	var refs []*firestore.DocumentRef
+	for _, line := range bytes.Split(raw, []byte("\n")) {
+		id := string(bytes.TrimSpace(line))
+		if id != "" {
+			refs = append(refs, src.Collection(cf.collection).Doc(id))
+		}
+	}
+	copied, missing := 0, 0
+	for start := 0; start < len(refs); start += 100 {
+		end := start + 100
+		if end > len(refs) {
+			end = len(refs)
+		}
+		snaps, err := src.GetAll(ctx, refs[start:end])
+		if err != nil {
+			log.Fatalf("source GetAll: %v", err)
+		}
+		batch := dst.Batch()
+		n := 0
+		for _, s := range snaps {
+			if !s.Exists() {
+				missing++
+				log.Printf("MISSING in source: %s", s.Ref.ID)
+				continue
+			}
+			batch.Set(dst.Collection(cf.collection).Doc(s.Ref.ID), s.Data())
+			n++
+		}
+		if n > 0 {
+			if _, err := batch.Commit(ctx); err != nil {
+				log.Fatalf("kor commit: %v", err)
+			}
+			copied += n
+		}
+	}
+	log.Printf("SYNC DONE: %d copied, %d missing (of %d requested)", copied, missing, len(refs))
 }
 
 func runVerify(args []string) {

@@ -220,7 +220,11 @@ func korClient(ctx context.Context, cf copyFlags) *firestore.Client {
 // over a large collection hits Firestore's "Query timed out" after ~60s;
 // paging sidesteps it and makes runs resumable. Transient page errors retry
 // from the cursor.
-func forEachDoc(ctx context.Context, src *firestore.Client, collection, startAfter string, fn func(*firestore.DocumentSnapshot) error) (last string, total int, err error) {
+//
+// durable reports the last id the caller has durably persisted (for the
+// importer, the last committed doc). Retries resume from it rather than from
+// the failed attempt's own progress, which may be empty.
+func forEachDoc(ctx context.Context, src *firestore.Client, collection, startAfter string, durable func() string, fn func(*firestore.DocumentSnapshot) error) (last string, total int, err error) {
 	const pageSize = 3000
 	cursor := startAfter
 	for {
@@ -231,14 +235,23 @@ func forEachDoc(ctx context.Context, src *firestore.Client, collection, startAft
 		var pageDocs int
 		var pageErr error
 		for attempt := 1; attempt <= 4; attempt++ {
-			pageDocs, cursor, pageErr = readPage(ctx, q, fn)
+			var pageLast string
+			pageDocs, pageLast, pageErr = readPage(ctx, q, fn)
 			if pageErr == nil {
+				cursor = pageLast
 				break
 			}
+			// A failed attempt reports only the docs IT processed, so pageLast
+			// may be "" (or behind) even though earlier attempts got further.
+			// Resume from the caller's durable cursor — the last *committed*
+			// doc — and never let a failure move the cursor backwards, which
+			// would restart the whole scan from the beginning.
 			if attempt < 4 {
+				if resumeAt := durable(); resumeAt != "" {
+					cursor = resumeAt
+				}
 				log.Printf("page after %q failed (attempt %d): %v — retrying", cursor, attempt, pageErr)
 				time.Sleep(time.Duration(attempt*attempt) * time.Second)
-				// Rebuild the query from the last durable cursor.
 				q = src.Collection(collection).OrderBy(firestore.DocumentID, firestore.Asc).Limit(pageSize)
 				if cursor != "" {
 					q = q.StartAfter(cursor)
@@ -252,6 +265,35 @@ func forEachDoc(ctx context.Context, src *firestore.Client, collection, startAft
 		if pageDocs < pageSize {
 			return cursor, total, nil
 		}
+	}
+}
+
+// estimateSize approximates a document's encoded payload in bytes. It only has
+// to be good enough to keep a batch under a message-size cap, so it uses fixed
+// costs for scalars rather than encoding anything.
+func estimateSize(v any) int {
+	switch t := v.(type) {
+	case nil:
+		return 1
+	case string:
+		return len(t) + 2
+	case []byte:
+		return len(t) + 2
+	case map[string]any:
+		n := 2
+		for k, val := range t {
+			n += len(k) + 3 + estimateSize(val)
+		}
+		return n
+	case []any:
+		n := 2
+		for _, val := range t {
+			n += estimateSize(val) + 1
+		}
+		return n
+	default:
+		// numbers, bools, timestamps, refs, geopoints
+		return 16
 	}
 }
 
@@ -310,31 +352,49 @@ func runImport(args []string) {
 	}
 
 	start := time.Now()
-	const batchSize = 100
+	// Cap a commit by BOTH document count and estimated payload bytes. Count
+	// alone is not enough: collections vary by two orders of magnitude in doc
+	// size (a text cache averages ~1.5 KB/doc, a TMDB person mirror ~22 KB with
+	// a 640 KB tail), so a fixed 100-doc batch can build a >20 MB Commit that
+	// blows past gRPC's 4 MB default message limit and dies as a deadline. The
+	// byte cap keeps a commit well inside that regardless of collection shape.
+	const (
+		batchSize  = 100
+		batchBytes = 2 << 20 // 2 MiB of estimated document payload
+	)
 	batch := dst.Batch()
-	inBatch, imported := 0, 0
-	var lastInBatch string
+	inBatch, batchedBytes, imported := 0, 0, 0
+	var lastInBatch, lastCommitted string
 	flush := func() error {
 		if inBatch == 0 {
 			return nil
 		}
-		if _, err := batch.Commit(ctx); err != nil {
+		_, err := batch.Commit(ctx)
+		// Reset unconditionally: on failure the retry re-reads these docs from
+		// lastCommitted, so keeping the failed writes would recommit them and
+		// grow the batch on every attempt until it can never succeed.
+		batch = dst.Batch()
+		inBatch, batchedBytes = 0, 0
+		if err != nil {
 			return fmt.Errorf("commit batch: %w", err)
 		}
-		batch = dst.Batch()
-		inBatch = 0
+		lastCommitted = lastInBatch
 		if *stateFile != "" {
-			_ = os.WriteFile(*stateFile, []byte(lastInBatch), 0o644)
+			_ = os.WriteFile(*stateFile, []byte(lastCommitted), 0o644)
 		}
 		return nil
 	}
 
-	last, total, err := forEachDoc(ctx, src, cf.collection, cursor, func(snap *firestore.DocumentSnapshot) error {
-		batch.Set(dst.Collection(cf.collection).Doc(snap.Ref.ID), snap.Data())
+	durable := func() string { return lastCommitted }
+
+	last, total, err := forEachDoc(ctx, src, cf.collection, cursor, durable, func(snap *firestore.DocumentSnapshot) error {
+		data := snap.Data()
+		batch.Set(dst.Collection(cf.collection).Doc(snap.Ref.ID), data)
 		inBatch++
+		batchedBytes += estimateSize(data)
 		imported++
 		lastInBatch = snap.Ref.ID
-		if inBatch >= batchSize {
+		if inBatch >= batchSize || batchedBytes >= batchBytes {
 			if err := flush(); err != nil {
 				return err
 			}
@@ -443,7 +503,9 @@ func runVerify(args []string) {
 		pending = pending[:0]
 	}
 
-	_, scanned, err := forEachDoc(ctx, src, cf.collection, "", func(snap *firestore.DocumentSnapshot) error {
+	// verify is read-only, so there is no durable write position to resume
+	// from — retries fall back to the failed attempt's own progress.
+	_, scanned, err := forEachDoc(ctx, src, cf.collection, "", func() string { return "" }, func(snap *firestore.DocumentSnapshot) error {
 		total++
 		if cf.sample > 1 && total%cf.sample != 0 {
 			return nil

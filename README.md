@@ -27,7 +27,7 @@ or build from source (Go 1.26+):
 
 ```bash
 go install github.com/omelas-tech/kor/cmd/kord@latest
-go install github.com/omelas-tech/kor/cmd/kor@latest    # CLI: import/verify/bench/stats
+go install github.com/omelas-tech/kor/cmd/kor@latest    # CLI: import/export/verify/bench/stats
 kord -pg-dsn "postgres://user@localhost/kor"
 ```
 
@@ -78,6 +78,12 @@ production application's full API test suite passing against Kor unchanged):
 - A sort-key encoding whose memcmp order equals Firestore's documented
   cross-type ordering (the foundation for composite indexes), fuzz-verified
   against a reference comparator
+- **A reversible migration path**: `kor import` copies a collection in from a
+  live Firestore project (resumable, byte-aware batching), `kor verify` diffs
+  the two, and `kor export` replays it back out — rate-limited to stay inside
+  Firestore's write ceiling. Without the reverse direction a cutover is a
+  one-way door: documents written after it exist only in Kor, so "point the app
+  back at Firestore" silently loses them. Export replays writes, not deletes.
 
 Query execution note: Postgres narrows candidates (collection bounds, jsonb
 containment, `__name__`-ordered scans with cursor/limit pushdown) and full

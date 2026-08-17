@@ -1,7 +1,8 @@
 // kor is the Kor command-line tool: collection import from a live Firestore
-// project, content verification, and store stats.
+// project, export back to it, content verification, and store stats.
 //
 //	kor import -collection my_collection -project my-project -kor 127.0.0.1:6565 [-creds sa.json]
+//	kor export -collection my_collection -project my-project -kor 127.0.0.1:6565 [-creds sa.json] [-dry-run] [-rate 400]
 //	kor verify -collection my_collection -project my-project -kor 127.0.0.1:6565 [-creds sa.json] [-sample 0]
 //	kor bench  -collection my_collection -project my-project -pg-dsn postgres://... [-n 300]
 //	kor stats  -pg-dsn postgres://...
@@ -34,6 +35,8 @@ func main() {
 	switch os.Args[1] {
 	case "import":
 		runImport(os.Args[2:])
+	case "export":
+		runExport(os.Args[2:])
 	case "verify":
 		runVerify(os.Args[2:])
 	case "stats":
@@ -46,7 +49,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: kor <import|verify|stats|bench> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: kor <import|export|verify|stats|bench> [flags]")
 	os.Exit(2)
 }
 

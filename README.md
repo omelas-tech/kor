@@ -100,10 +100,44 @@ On the roadmap (in build order):
 | 3 | Realtime: `Listen`/`Write` streams for the native mobile SDKs |
 | 4 | Security rules interpreter (`firestore.rules` verbatim) + Firebase Auth token verification |
 | 5 | WebChannel transport (browser `firebase-js` support) |
-| 6 | Migration tooling: streaming importer, verifier, bidirectional mirror |
+| 6 | Migration tooling: ~~streaming importer~~, ~~verifier~~, ~~reverse export~~ (all shipped, see [docs/cli.md](docs/cli.md)); bidirectional mirror remains |
 
 Not in scope: Firebase Auth, Storage, FCM — Kor interoperates with them
 rather than replacing them.
+
+## Migrating an existing Firestore project
+
+The CLI does the round trip. Full reference: **[docs/cli.md](docs/cli.md)**.
+
+```bash
+# 1. Copy a collection in. Resumable — re-run to continue after any interruption.
+kor import -collection my_collection -project my-project -state /var/lib/kor/my_collection.state
+
+# 2. Prove it matches, document by document.
+kor verify -collection my_collection -project my-project
+# VERIFY: source=102684 checked=102684 missing=0 mismatch=0
+
+# 3. Point your application at Kor for that collection and watch it.
+
+# 4. If you need to go back: replay Kor's writes to Firestore, then flip.
+kor export -collection my_collection -project my-project -dry-run   # look first
+kor export -collection my_collection -project my-project
+```
+
+Two things worth knowing before you plan a cutover.
+
+**A long import outruns a clean verify.** `verify` compares against a *moving*
+source: if the collection takes on writes faster than the import copies, it will
+report `missing` no matter how correct the copy is. That is arithmetic, not a
+bug. Either quiesce writes, or cap the write rate first and use `import -ids`
+with the missing ids to close the remaining gap — which is seconds of work once
+the gap is bounded.
+
+**Migrate regenerable data first.** Caches and re-fetchable mirrors let you
+treat a small window of lost writes as a non-event, which keeps early cutovers
+cheap and reversible. Save the data you cannot reconstruct until you have
+point-in-time recovery on Kor's Postgres *and* have actually restored from it
+once. A backup nobody has restored is not a backup.
 
 ## Architecture (short version)
 

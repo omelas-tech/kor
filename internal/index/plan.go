@@ -1,9 +1,12 @@
 package index
 
 import (
+	"bytes"
+
 	pb "cloud.google.com/go/firestore/apiv1/firestorepb"
 
 	"github.com/omelas-tech/kor/internal/query"
+	"github.com/omelas-tech/kor/internal/value"
 )
 
 // Planning: decide whether a composite index can serve a query, and with what
@@ -16,28 +19,29 @@ import (
 // the reference implementation. Every shape rejected here is a performance
 // opportunity, never a correctness risk.
 
-// Plan is a chosen index and the range to scan.
+// Plan is a chosen index and the half-open byte range to scan.
+//
+// Everything — the equality prefix, cursors, and inequality filters — collapses
+// into [Lo, Hi). That is possible because the key encoding is prefix-free: a
+// partial key (fewer fields than the index has) is a prefix of every full key
+// under it, so "everything at or after this position" is a byte comparison and
+// "everything strictly after this group" is PrefixEnd of it. A nil Hi means
+// unbounded above.
 type Plan struct {
 	Def      Def
-	Prefix   []byte // equality prefix; the scan is [Prefix, PrefixEnd(Prefix))
-	Reversed bool   // scan descending
+	Lo, Hi   []byte
+	Reversed bool // scan descending
 }
 
 // Eligible reports whether a query is a shape this package can serve at all,
 // independent of which indexes exist. Split out so the reasons are testable and
 // nameable rather than buried in one boolean.
 func Eligible(q *query.Query) bool {
-	// Cursors are not handled yet: resuming mid-index means translating cursor
-	// values into a key bound, and getting that subtly wrong skips or repeats
-	// documents at page boundaries — the kind of bug that only shows up under
-	// pagination in production.
-	if q.Start != nil || q.End != nil {
-		return false
-	}
-	// Only conjunctions of equality filters. Inequalities need a range bound
-	// rather than a prefix, and disjunctions need a union of scans; both are
-	// worth doing, neither is done here.
-	if _, ok := equalityFields(q.Where); !ok {
+	// A conjunction of equalities, optionally with ONE inequality on the first
+	// ordering field — which is the only place Firestore allows one, and the
+	// only position a byte range can express. Disjunctions need a union of
+	// scans and are still declined.
+	if _, _, ok := splitFilters(q); !ok {
 		return false
 	}
 	return true
@@ -53,7 +57,7 @@ func For(q *query.Query, defs []Def, ready map[int64]bool) (*Plan, bool) {
 	if !Eligible(q) {
 		return nil, false
 	}
-	eq, _ := equalityFields(q.Where)
+	eq, _, _ := splitFilters(q)
 
 	for _, d := range defs {
 		if d.CollectionID != q.CollectionID || d.Group != q.AllDescendants {
@@ -66,7 +70,11 @@ func For(q *query.Query, defs []Def, ready map[int64]bool) (*Plan, bool) {
 		if !ok {
 			continue
 		}
-		return &Plan{Def: d, Prefix: prefix, Reversed: reversed}, true
+		lo, hi, ok := bounds(d, len(eq), prefix, reversed, q)
+		if !ok {
+			continue
+		}
+		return &Plan{Def: d, Lo: lo, Hi: hi, Reversed: reversed}, true
 	}
 	return nil, false
 }
@@ -132,54 +140,6 @@ func match(d Def, eq map[string]*pb.Value, order []query.OrderSpec) (prefix []by
 	return d.PrefixKey(eqValues), reversed, true
 }
 
-// equalityFields collects field==value filters from a pure AND tree.
-//
-// Returns ok=false for anything else — an inequality, IN, array-contains, a
-// disjunction, or a __name__ filter — because each needs bounds this planner
-// does not build, and guessing would produce a scan that quietly omits results.
-func equalityFields(f *pb.StructuredQuery_Filter) (map[string]*pb.Value, bool) {
-	out := map[string]*pb.Value{}
-	if f == nil {
-		return out, true
-	}
-	if !collectEquality(f, out) {
-		return nil, false
-	}
-	return out, true
-}
-
-func collectEquality(f *pb.StructuredQuery_Filter, out map[string]*pb.Value) bool {
-	switch t := f.GetFilterType().(type) {
-	case *pb.StructuredQuery_Filter_CompositeFilter:
-		if t.CompositeFilter.GetOp() != pb.StructuredQuery_CompositeFilter_AND {
-			return false
-		}
-		for _, sub := range t.CompositeFilter.GetFilters() {
-			if !collectEquality(sub, out) {
-				return false
-			}
-		}
-		return true
-	case *pb.StructuredQuery_Filter_FieldFilter:
-		ff := t.FieldFilter
-		if ff.GetOp() != pb.StructuredQuery_FieldFilter_EQUAL {
-			return false
-		}
-		path := ff.GetField().GetFieldPath()
-		if path == NameField {
-			return false // a name filter bounds the scan differently
-		}
-		if _, dup := out[path]; dup {
-			return false // two equalities on one field: degenerate, let the general path handle it
-		}
-		out[path] = ff.GetValue()
-		return true
-	default:
-		// Unary filters (IS NULL / IS NAN) are not equality in the index sense.
-		return false
-	}
-}
-
 // effectiveFields is a definition's fields plus the implicit __name__
 // terminator, in the direction of the last field — the exact shape Key()
 // encodes, and the shape a query's effective ordering is expressed in.
@@ -191,4 +151,245 @@ func effectiveFields(d Def) []Field {
 	out = append(out, d.Fields...)
 	out = append(out, Field{Path: NameField, Desc: d.trailingDirection()})
 	return out
+}
+
+// Comparison operators this planner can turn into a byte bound.
+type ineqOp int
+
+const (
+	gt ineqOp = iota
+	gte
+	lt
+	lte
+)
+
+type inequality struct {
+	path  string
+	op    ineqOp
+	value *pb.Value
+}
+
+// bounds folds the equality prefix, an optional inequality, and any cursors
+// into one half-open byte range.
+//
+// Two different notions of "direction" meet here, and conflating them is the
+// easy mistake:
+//
+//   - An INEQUALITY constrains values, so which side of the range it bounds
+//     depends on how the INDEX FIELD is encoded. On an ascending field, score>5
+//     is a lower byte bound; on a descending field the bytes are complemented,
+//     so the same filter becomes an upper one.
+//   - A CURSOR names a position in QUERY order, so which end it bounds depends
+//     on whether the scan runs with or against the index — the Reversed flag.
+//
+// Getting either backwards does not error. It returns a page from the wrong end
+// of the range, which is why every case is written out instead of folded into
+// arithmetic.
+func bounds(d Def, eqCount int, prefix []byte, reversed bool, q *query.Query) (lo, hi []byte, ok bool) {
+	lo, hi = prefix, PrefixEnd(prefix)
+
+	fields := effectiveFields(d)
+	if eqCount >= len(fields) {
+		return lo, hi, true
+	}
+	fieldDesc := fields[eqCount].Desc
+
+	if _, ineq, valid := splitFilters(q); valid && ineq != nil {
+		k := cursorKey(d, eqCount, prefix, []*pb.Value{ineq.value})
+		switch ineq.op {
+		case gt:
+			if fieldDesc {
+				hi = minBound(hi, k)
+			} else {
+				lo = maxBound(lo, PrefixEnd(k))
+			}
+		case gte:
+			if fieldDesc {
+				hi = minBound(hi, PrefixEnd(k))
+			} else {
+				lo = maxBound(lo, k)
+			}
+		case lt:
+			if fieldDesc {
+				lo = maxBound(lo, PrefixEnd(k))
+			} else {
+				hi = minBound(hi, k)
+			}
+		case lte:
+			if fieldDesc {
+				lo = maxBound(lo, k)
+			} else {
+				hi = minBound(hi, PrefixEnd(k))
+			}
+		}
+	}
+
+	if q.Start != nil {
+		k := cursorKey(d, eqCount, prefix, capVals(q.Start.Values, len(q.Order)))
+		if reversed {
+			hi = minBound(hi, endBoundFor(k, q.Start.Before))
+		} else {
+			lo = maxBound(lo, startBoundFor(k, q.Start.Before))
+		}
+	}
+	if q.End != nil {
+		k := cursorKey(d, eqCount, prefix, capVals(q.End.Values, len(q.Order)))
+		inclusive := !q.End.Before
+		if reversed {
+			lo = maxBound(lo, startBoundFor(k, inclusive))
+		} else {
+			hi = minBound(hi, endBoundFor(k, inclusive))
+		}
+	}
+
+	// An empty range is legal and simply yields nothing.
+	if hi != nil && bytes.Compare(lo, hi) >= 0 {
+		return lo, lo, true
+	}
+	return lo, hi, true
+}
+
+// startBoundFor is the inclusive lower bound for a position: at the group when
+// inclusive, past all of it when not.
+func startBoundFor(k []byte, inclusive bool) []byte {
+	if inclusive {
+		return k
+	}
+	return PrefixEnd(k)
+}
+
+// endBoundFor is the exclusive upper bound for a position: past the whole group
+// when inclusive, at its start when not.
+func endBoundFor(k []byte, inclusive bool) []byte {
+	if inclusive {
+		return PrefixEnd(k)
+	}
+	return k
+}
+
+// cursorKey encodes values at the ordering positions after the equality
+// prefix, in the index's own directions.
+func cursorKey(d Def, eqCount int, prefix []byte, vals []*pb.Value) []byte {
+	key := append([]byte(nil), prefix...)
+	fields := effectiveFields(d)
+	for i, v := range vals {
+		pos := eqCount + i
+		if pos >= len(fields) {
+			break
+		}
+		if fields[pos].Desc {
+			key = value.AppendSortKeyDesc(key, v)
+		} else {
+			key = value.AppendSortKey(key, v)
+		}
+	}
+	return key
+}
+
+func maxBound(a, b []byte) []byte {
+	if b == nil {
+		return a
+	}
+	if a == nil || bytes.Compare(b, a) > 0 {
+		return b
+	}
+	return a
+}
+
+// minBound treats nil as unbounded above.
+func minBound(a, b []byte) []byte {
+	if b == nil {
+		return a
+	}
+	if a == nil || bytes.Compare(b, a) < 0 {
+		return b
+	}
+	return a
+}
+
+// splitFilters separates a pure AND tree into equalities plus at most one
+// inequality, which Firestore requires to be on the first ordering field.
+//
+// Returns ok=false for anything else — disjunctions, IN, array-contains, unary
+// null/NaN filters, __name__ filters, a second inequality field — because each
+// needs bounds this planner does not build, and guessing produces a scan that
+// quietly omits results.
+func splitFilters(q *query.Query) (eq map[string]*pb.Value, ineq *inequality, ok bool) {
+	eq = map[string]*pb.Value{}
+	if !collect(q.Where, eq, &ineq) {
+		return nil, nil, false
+	}
+	if ineq != nil {
+		// The inequality field must be the first ordering term, or the range it
+		// describes is not contiguous in this index.
+		if len(q.Order) == 0 || q.Order[0].IsName || q.Order[0].Path.String() != ineq.path {
+			return nil, nil, false
+		}
+	}
+	return eq, ineq, true
+}
+
+func collect(f *pb.StructuredQuery_Filter, eq map[string]*pb.Value, ineq **inequality) bool {
+	if f == nil {
+		return true
+	}
+	switch t := f.GetFilterType().(type) {
+	case *pb.StructuredQuery_Filter_CompositeFilter:
+		if t.CompositeFilter.GetOp() != pb.StructuredQuery_CompositeFilter_AND {
+			return false
+		}
+		for _, sub := range t.CompositeFilter.GetFilters() {
+			if !collect(sub, eq, ineq) {
+				return false
+			}
+		}
+		return true
+	case *pb.StructuredQuery_Filter_FieldFilter:
+		ff := t.FieldFilter
+		path := ff.GetField().GetFieldPath()
+		if path == NameField {
+			return false
+		}
+		switch ff.GetOp() {
+		case pb.StructuredQuery_FieldFilter_EQUAL:
+			if _, dup := eq[path]; dup {
+				return false
+			}
+			eq[path] = ff.GetValue()
+			return true
+		case pb.StructuredQuery_FieldFilter_GREATER_THAN,
+			pb.StructuredQuery_FieldFilter_GREATER_THAN_OR_EQUAL,
+			pb.StructuredQuery_FieldFilter_LESS_THAN,
+			pb.StructuredQuery_FieldFilter_LESS_THAN_OR_EQUAL:
+			if *ineq != nil {
+				return false // one inequality field only
+			}
+			var op ineqOp
+			switch ff.GetOp() {
+			case pb.StructuredQuery_FieldFilter_GREATER_THAN:
+				op = gt
+			case pb.StructuredQuery_FieldFilter_GREATER_THAN_OR_EQUAL:
+				op = gte
+			case pb.StructuredQuery_FieldFilter_LESS_THAN:
+				op = lt
+			default:
+				op = lte
+			}
+			*ineq = &inequality{path: path, op: op, value: ff.GetValue()}
+			return true
+		default:
+			return false
+		}
+	default:
+		return false
+	}
+}
+
+// capVals mirrors query.compareToCursor, which ignores cursor values beyond the
+// ordering length rather than treating them as additional constraints.
+func capVals(vals []*pb.Value, n int) []*pb.Value {
+	if len(vals) > n {
+		return vals[:n]
+	}
+	return vals
 }

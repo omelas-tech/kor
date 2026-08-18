@@ -165,3 +165,216 @@ func TestIndexedResultsMatchGeneralPath(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) { bothWays(t, s, defs, mkQuery(t, tc.sq)) })
 	}
 }
+
+func cmpFilter(path string, op pb.StructuredQuery_FieldFilter_Operator, v *pb.Value) *pb.StructuredQuery_Filter {
+	return &pb.StructuredQuery_Filter{FilterType: &pb.StructuredQuery_Filter_FieldFilter{
+		FieldFilter: &pb.StructuredQuery_FieldFilter{
+			Field: &pb.StructuredQuery_FieldReference{FieldPath: path}, Op: op, Value: v,
+		}}}
+}
+
+func andFilter(subs ...*pb.StructuredQuery_Filter) *pb.StructuredQuery_Filter {
+	return &pb.StructuredQuery_Filter{FilterType: &pb.StructuredQuery_Filter_CompositeFilter{
+		CompositeFilter: &pb.StructuredQuery_CompositeFilter{
+			Op: pb.StructuredQuery_CompositeFilter_AND, Filters: subs,
+		}}}
+}
+
+// Cursors are where an index most easily goes wrong, because a start cursor
+// names a position in QUERY order: when the scan runs against the index it must
+// bound the HIGH end of the key range, and the inclusive/exclusive sense flips
+// with it. A mistake here does not error — it returns a page from the wrong end
+// or repeats documents across page boundaries.
+func TestIndexedCursorsMatchGeneralPath(t *testing.T) {
+	s := openStore(t)
+	ctx := context.Background()
+
+	d := index.Def{CollectionID: "posts", Fields: []index.Field{{Path: "author"}, {Path: "score"}}}
+	dDesc := index.Def{CollectionID: "posts", Fields: []index.Field{{Path: "author"}, {Path: "score", Desc: true}}}
+	defs := []index.Def{d, dDesc}
+	if err := s.SetIndexes(ctx, defs); err != nil {
+		t.Fatal(err)
+	}
+	seedPosts(t, s, 60)
+	for _, def := range defs {
+		if _, err := s.BackfillIndex(ctx, def); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	q := func(dir pb.StructuredQuery_Direction, start, end *pb.Cursor, limit int32) *pb.StructuredQuery {
+		sq := &pb.StructuredQuery{
+			From: from("posts"), Where: eqFilter("author", sval("ann")),
+			OrderBy: []*pb.StructuredQuery_Order{orderBy("score", dir)},
+			StartAt: start, EndAt: end,
+		}
+		if limit > 0 {
+			sq.Limit = wrapperspb.Int32(limit)
+		}
+		return sq
+	}
+	at := func(n int64, before bool) *pb.Cursor {
+		return &pb.Cursor{Values: []*pb.Value{ival(n)}, Before: before}
+	}
+
+	cases := []struct {
+		name string
+		sq   *pb.StructuredQuery
+	}{
+		// before=true on a start cursor is startAt (inclusive); false is startAfter.
+		{"startAt asc", q(pb.StructuredQuery_ASCENDING, at(7, true), nil, 0)},
+		{"startAfter asc", q(pb.StructuredQuery_ASCENDING, at(7, false), nil, 0)},
+		// before=true on an end cursor is endBefore (exclusive); false is endAt.
+		{"endBefore asc", q(pb.StructuredQuery_ASCENDING, nil, at(12, true), 0)},
+		{"endAt asc", q(pb.StructuredQuery_ASCENDING, nil, at(12, false), 0)},
+		{"bounded both ends asc", q(pb.StructuredQuery_ASCENDING, at(4, true), at(15, false), 0)},
+
+		// The same cursors against a descending query, where the ascending index
+		// is scanned in reverse and every bound swaps ends.
+		{"startAt desc", q(pb.StructuredQuery_DESCENDING, at(7, true), nil, 0)},
+		{"startAfter desc", q(pb.StructuredQuery_DESCENDING, at(7, false), nil, 0)},
+		{"endBefore desc", q(pb.StructuredQuery_DESCENDING, nil, at(12, true), 0)},
+		{"endAt desc", q(pb.StructuredQuery_DESCENDING, nil, at(12, false), 0)},
+		{"bounded both ends desc", q(pb.StructuredQuery_DESCENDING, at(15, true), at(4, false), 0)},
+
+		{"cursor with limit", q(pb.StructuredQuery_ASCENDING, at(5, true), nil, 4)},
+		// A cursor past every value: the empty range must stay empty, not wrap.
+		{"cursor past the end", q(pb.StructuredQuery_ASCENDING, at(999, true), nil, 0)},
+		{"cursor before the start", q(pb.StructuredQuery_ASCENDING, nil, at(-999, true), 0)},
+		// Ties matter: several documents share a score, so an inclusive bound
+		// must take the whole group and an exclusive one must skip all of it.
+		{"inverted range yields nothing", q(pb.StructuredQuery_ASCENDING, at(15, true), at(4, false), 0)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) { bothWays(t, s, defs, mkQuery(t, tc.sq)) })
+	}
+}
+
+// An inequality bounds the range by VALUE, so which end it moves follows the
+// index field's own direction — the opposite axis from cursors. Both are
+// exercised together here because they narrow the same range and a sign error
+// in either is invisible until the results are compared.
+func TestIndexedInequalitiesMatchGeneralPath(t *testing.T) {
+	s := openStore(t)
+	ctx := context.Background()
+
+	d := index.Def{CollectionID: "posts", Fields: []index.Field{{Path: "author"}, {Path: "score"}}}
+	dDesc := index.Def{CollectionID: "posts", Fields: []index.Field{{Path: "author"}, {Path: "score", Desc: true}}}
+	defs := []index.Def{d, dDesc}
+	if err := s.SetIndexes(ctx, defs); err != nil {
+		t.Fatal(err)
+	}
+	seedPosts(t, s, 60)
+	for _, def := range defs {
+		if _, err := s.BackfillIndex(ctx, def); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ops := map[string]pb.StructuredQuery_FieldFilter_Operator{
+		"gt":  pb.StructuredQuery_FieldFilter_GREATER_THAN,
+		"gte": pb.StructuredQuery_FieldFilter_GREATER_THAN_OR_EQUAL,
+		"lt":  pb.StructuredQuery_FieldFilter_LESS_THAN,
+		"lte": pb.StructuredQuery_FieldFilter_LESS_THAN_OR_EQUAL,
+	}
+	dirs := map[string]pb.StructuredQuery_Direction{
+		"asc":  pb.StructuredQuery_ASCENDING,
+		"desc": pb.StructuredQuery_DESCENDING,
+	}
+	for opName, op := range ops {
+		for dirName, dir := range dirs {
+			t.Run(opName+"/"+dirName, func(t *testing.T) {
+				bothWays(t, s, defs, mkQuery(t, &pb.StructuredQuery{
+					From: from("posts"),
+					Where: andFilter(
+						eqFilter("author", sval("ann")),
+						cmpFilter("score", op, ival(9)),
+					),
+					OrderBy: []*pb.StructuredQuery_Order{orderBy("score", dir)},
+				}))
+			})
+		}
+	}
+
+	// An inequality and a cursor narrowing the same range at once.
+	t.Run("inequality plus cursor", func(t *testing.T) {
+		bothWays(t, s, defs, mkQuery(t, &pb.StructuredQuery{
+			From: from("posts"),
+			Where: andFilter(
+				eqFilter("author", sval("ann")),
+				cmpFilter("score", pb.StructuredQuery_FieldFilter_GREATER_THAN, ival(3)),
+			),
+			OrderBy: []*pb.StructuredQuery_Order{orderBy("score", pb.StructuredQuery_ASCENDING)},
+			StartAt: &pb.Cursor{Values: []*pb.Value{ival(8)}, Before: true},
+			Limit:   wrapperspb.Int32(3),
+		}))
+	})
+}
+
+// Hand-picked cases cover the shapes I thought of. This covers the ones I did
+// not: random combinations of direction, operator, cursor sense, limit and
+// offset, all diffed against the reference path.
+func TestIndexedRandomizedAgainstGeneralPath(t *testing.T) {
+	s := openStore(t)
+	ctx := context.Background()
+
+	d := index.Def{CollectionID: "posts", Fields: []index.Field{{Path: "author"}, {Path: "score"}}}
+	dDesc := index.Def{CollectionID: "posts", Fields: []index.Field{{Path: "author"}, {Path: "score", Desc: true}}}
+	defs := []index.Def{d, dDesc}
+	if err := s.SetIndexes(ctx, defs); err != nil {
+		t.Fatal(err)
+	}
+	seedPosts(t, s, 120)
+	for _, def := range defs {
+		if _, err := s.BackfillIndex(ctx, def); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ops := []pb.StructuredQuery_FieldFilter_Operator{
+		pb.StructuredQuery_FieldFilter_GREATER_THAN,
+		pb.StructuredQuery_FieldFilter_GREATER_THAN_OR_EQUAL,
+		pb.StructuredQuery_FieldFilter_LESS_THAN,
+		pb.StructuredQuery_FieldFilter_LESS_THAN_OR_EQUAL,
+	}
+	authors := []string{"ann", "bob", "cat"}
+	rnd := rand.New(rand.NewSource(2026))
+
+	for i := 0; i < 300; i++ {
+		sq := &pb.StructuredQuery{From: from("posts")}
+		where := []*pb.StructuredQuery_Filter{
+			eqFilter("author", sval(authors[rnd.Intn(len(authors))])),
+		}
+		if rnd.Intn(2) == 0 {
+			where = append(where, cmpFilter("score", ops[rnd.Intn(len(ops))], ival(int64(rnd.Intn(24)-2))))
+		}
+		if len(where) == 1 {
+			sq.Where = where[0]
+		} else {
+			sq.Where = andFilter(where...)
+		}
+		dir := pb.StructuredQuery_ASCENDING
+		if rnd.Intn(2) == 0 {
+			dir = pb.StructuredQuery_DESCENDING
+		}
+		sq.OrderBy = []*pb.StructuredQuery_Order{orderBy("score", dir)}
+		if rnd.Intn(2) == 0 {
+			sq.StartAt = &pb.Cursor{Values: []*pb.Value{ival(int64(rnd.Intn(24) - 2))}, Before: rnd.Intn(2) == 0}
+		}
+		if rnd.Intn(2) == 0 {
+			sq.EndAt = &pb.Cursor{Values: []*pb.Value{ival(int64(rnd.Intn(24) - 2))}, Before: rnd.Intn(2) == 0}
+		}
+		if rnd.Intn(3) == 0 {
+			sq.Limit = wrapperspb.Int32(int32(1 + rnd.Intn(6)))
+		}
+		if rnd.Intn(4) == 0 {
+			sq.Offset = int32(rnd.Intn(4))
+		}
+
+		q := mkQuery(t, sq)
+		if _, ok := index.For(q, defs, s.indexes.readySet()); !ok {
+			continue // a shape the planner declines; the general path already serves it
+		}
+		t.Run(fmt.Sprintf("case%03d", i), func(t *testing.T) { bothWays(t, s, defs, q) })
+	}
+}

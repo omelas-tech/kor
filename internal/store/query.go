@@ -340,8 +340,7 @@ func scanDoc(rows interface {
 // planner bug into a quietly short result set, which is the failure mode this
 // whole design exists to avoid.
 func (s *Store) runIndexed(ctx context.Context, q *query.Query, plan *index.Plan, yield func(*Doc) error) error {
-	lo := plan.Prefix
-	hi := index.PrefixEnd(lo)
+	lo, hi := plan.Lo, plan.Hi
 
 	order := "ASC"
 	if plan.Reversed {

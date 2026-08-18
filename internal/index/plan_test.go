@@ -1,6 +1,7 @@
 package index
 
 import (
+	"bytes"
 	"testing"
 
 	pb "cloud.google.com/go/firestore/apiv1/firestorepb"
@@ -30,6 +31,23 @@ func gtf(path string, v *pb.Value) *pb.StructuredQuery_Filter {
 			Op:    pb.StructuredQuery_FieldFilter_GREATER_THAN, Value: v,
 		}}}
 }
+
+func cmpf(path string, op pb.StructuredQuery_FieldFilter_Operator, v *pb.Value) *pb.StructuredQuery_Filter {
+	return &pb.StructuredQuery_Filter{FilterType: &pb.StructuredQuery_Filter_FieldFilter{
+		FieldFilter: &pb.StructuredQuery_FieldFilter{
+			Field: &pb.StructuredQuery_FieldReference{FieldPath: path}, Op: op, Value: v,
+		}}}
+}
+
+func andf(subs ...*pb.StructuredQuery_Filter) *pb.StructuredQuery_Filter {
+	return &pb.StructuredQuery_Filter{FilterType: &pb.StructuredQuery_Filter_CompositeFilter{
+		CompositeFilter: &pb.StructuredQuery_CompositeFilter{
+			Op: pb.StructuredQuery_CompositeFilter_AND, Filters: subs,
+		}}}
+}
+
+func strv(s string) *pb.Value { return &pb.Value{ValueType: &pb.Value_StringValue{StringValue: s}} }
+func intv(n int64) *pb.Value  { return &pb.Value{ValueType: &pb.Value_IntegerValue{IntegerValue: n}} }
 
 func ord(path string, dir pb.StructuredQuery_Direction) *pb.StructuredQuery_Order {
 	return &pb.StructuredQuery_Order{
@@ -66,7 +84,7 @@ func TestPlannerSelectsAMatchingIndex(t *testing.T) {
 	if plan.Reversed {
 		t.Error("ascending query against an ascending index should not reverse the scan")
 	}
-	if len(plan.Prefix) == 0 {
+	if len(plan.Lo) == 0 {
 		t.Error("prefix must bound the scan to the equality group")
 	}
 }
@@ -129,14 +147,122 @@ func TestPlannerRefusesAnIndexThatIsNotBackfilled(t *testing.T) {
 	}
 }
 
-func TestCursorsFallBack(t *testing.T) {
-	q := parse(t, &pb.StructuredQuery{
-		From: from("posts"), Where: eqf("author", &pb.Value{ValueType: &pb.Value_StringValue{StringValue: "ann"}}),
+func TestCursorNarrowsTheScanRange(t *testing.T) {
+	base := parse(t, &pb.StructuredQuery{
+		From: from("posts"), Where: eqf("author", strv("ann")),
 		OrderBy: []*pb.StructuredQuery_Order{ord("score", pb.StructuredQuery_ASCENDING)},
-		StartAt: &pb.Cursor{Values: []*pb.Value{{ValueType: &pb.Value_IntegerValue{IntegerValue: 3}}}},
 	})
-	if Eligible(q) {
-		t.Error("cursors are not translated to key bounds yet; serving them would skip " +
-			"or repeat documents at page boundaries")
+	withCursor := parse(t, &pb.StructuredQuery{
+		From: from("posts"), Where: eqf("author", strv("ann")),
+		OrderBy: []*pb.StructuredQuery_Order{ord("score", pb.StructuredQuery_ASCENDING)},
+		StartAt: &pb.Cursor{Values: []*pb.Value{intv(3)}, Before: true},
+	})
+	ready := map[int64]bool{authorScore.ID(): true}
+
+	b, ok := For(base, []Def{authorScore}, ready)
+	if !ok {
+		t.Fatal("the uncursored query should plan")
+	}
+	c, ok := For(withCursor, []Def{authorScore}, ready)
+	if !ok {
+		t.Fatal("a cursor on the ordering field is a key bound, so it should plan")
+	}
+	if bytes.Compare(c.Lo, b.Lo) <= 0 {
+		t.Errorf("a start cursor must raise the lower bound: base=%x cursor=%x", b.Lo, c.Lo)
+	}
+	if !bytes.Equal(c.Hi, b.Hi) {
+		t.Errorf("a start cursor must not move the upper bound: base=%x cursor=%x", b.Hi, c.Hi)
+	}
+}
+
+// A start cursor names a position in QUERY order. When the scan runs against
+// the index it bounds the HIGH end of the byte range, not the low one — the
+// case most likely to be written backwards, because it reads as "start".
+func TestStartCursorBoundsTheHighEndWhenReversed(t *testing.T) {
+	q := parse(t, &pb.StructuredQuery{
+		From: from("posts"), Where: eqf("author", strv("ann")),
+		OrderBy: []*pb.StructuredQuery_Order{ord("score", pb.StructuredQuery_DESCENDING)},
+		StartAt: &pb.Cursor{Values: []*pb.Value{intv(3)}, Before: true},
+	})
+	base := parse(t, &pb.StructuredQuery{
+		From: from("posts"), Where: eqf("author", strv("ann")),
+		OrderBy: []*pb.StructuredQuery_Order{ord("score", pb.StructuredQuery_DESCENDING)},
+	})
+	ready := map[int64]bool{authorScore.ID(): true}
+
+	b, _ := For(base, []Def{authorScore}, ready)
+	p, ok := For(q, []Def{authorScore}, ready)
+	if !ok {
+		t.Fatal("expected a reversed plan")
+	}
+	if !p.Reversed {
+		t.Fatal("an ascending index serving a descending query must scan reversed")
+	}
+	if bytes.Compare(p.Hi, b.Hi) >= 0 {
+		t.Errorf("a start cursor on a reversed scan must lower the upper bound: base=%x got=%x", b.Hi, p.Hi)
+	}
+	if !bytes.Equal(p.Lo, b.Lo) {
+		t.Errorf("it must not move the lower bound: base=%x got=%x", b.Lo, p.Lo)
+	}
+}
+
+// An inequality constrains values, so which end it bounds follows the INDEX
+// FIELD's direction — the opposite axis from the cursor case above.
+func TestInequalityBoundsFollowFieldDirectionNotScanDirection(t *testing.T) {
+	mk := func(dir pb.StructuredQuery_Direction) *query.Query {
+		return parse(t, &pb.StructuredQuery{
+			From: from("posts"),
+			Where: andf(
+				eqf("author", strv("ann")),
+				cmpf("score", pb.StructuredQuery_FieldFilter_GREATER_THAN, intv(3)),
+			),
+			OrderBy: []*pb.StructuredQuery_Order{ord("score", dir)},
+		})
+	}
+	ready := map[int64]bool{authorScore.ID(): true}
+
+	asc, ok := For(mk(pb.StructuredQuery_ASCENDING), []Def{authorScore}, ready)
+	if !ok {
+		t.Fatal("an inequality on the first ordering field should plan")
+	}
+	desc, ok := For(mk(pb.StructuredQuery_DESCENDING), []Def{authorScore}, ready)
+	if !ok {
+		t.Fatal("the same filter with reversed ordering should also plan")
+	}
+	// Same index field (ascending), so "score > 3" is the same byte range in
+	// both; only the walk direction differs.
+	if !bytes.Equal(asc.Lo, desc.Lo) || !bytes.Equal(asc.Hi, desc.Hi) {
+		t.Errorf("scan direction must not change which bytes qualify:\n asc  [%x,%x)\n desc [%x,%x)",
+			asc.Lo, asc.Hi, desc.Lo, desc.Hi)
+	}
+	if !desc.Reversed {
+		t.Error("the descending query should still scan reversed")
+	}
+}
+
+func TestPlannerStillDeclinesUnservableShapes(t *testing.T) {
+	ready := map[int64]bool{authorScore.ID(): true}
+	cases := map[string]*pb.StructuredQuery{
+		"two inequality fields": {
+			From: from("posts"),
+			Where: andf(
+				cmpf("score", pb.StructuredQuery_FieldFilter_GREATER_THAN, intv(3)),
+				cmpf("views", pb.StructuredQuery_FieldFilter_LESS_THAN, intv(9)),
+			),
+			OrderBy: []*pb.StructuredQuery_Order{ord("score", pb.StructuredQuery_ASCENDING)},
+		},
+		"inequality off the first ordering field": {
+			From:    from("posts"),
+			Where:   cmpf("views", pb.StructuredQuery_FieldFilter_GREATER_THAN, intv(3)),
+			OrderBy: []*pb.StructuredQuery_Order{ord("score", pb.StructuredQuery_ASCENDING)},
+		},
+	}
+	for name, sq := range cases {
+		t.Run(name, func(t *testing.T) {
+			q := parse(t, sq)
+			if _, ok := For(q, []Def{authorScore}, ready); ok {
+				t.Error("planner served a shape whose results would not be a contiguous key range")
+			}
+		})
 	}
 }

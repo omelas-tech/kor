@@ -41,6 +41,8 @@ func run(m *testing.M) int {
 	pgctl, err2 := exec.LookPath("pg_ctl")
 	if err1 != nil || err2 != nil {
 		clusterErr = fmt.Errorf("initdb/pg_ctl not found in PATH; install PostgreSQL to run these tests")
+		_ = err1
+		_ = err2
 		return m.Run()
 	}
 
@@ -48,21 +50,27 @@ func run(m *testing.M) int {
 	if out, err := exec.Command(initdb, "-D", dataDir, "-A", "trust", "-U", "kor",
 		"--no-sync", "-E", "UTF8", "--locale=C").CombinedOutput(); err != nil {
 		clusterErr = fmt.Errorf("initdb: %v\n%s", err, out)
-		return m.Run()
+		return requireOrRun(m)
 	}
 
 	port, err := freePort()
 	if err != nil {
 		clusterErr = err
-		return m.Run()
+		return requireOrRun(m)
 	}
 
-	opts := fmt.Sprintf("-p %d -c listen_addresses=127.0.0.1 -c fsync=off -c synchronous_commit=off -c full_page_writes=off", port)
+	// unix_socket_directories must point into our own temp dir. The compiled
+	// default is a shared system path (/var/run/postgresql on Debian) that an
+	// unprivileged user usually cannot write, which made cluster startup fail
+	// on CI runners even though everything else was in place. A throwaway
+	// cluster reached only over TCP has no business writing there anyway.
+	opts := fmt.Sprintf("-p %d -c listen_addresses=127.0.0.1 -c unix_socket_directories=%s"+
+		" -c fsync=off -c synchronous_commit=off -c full_page_writes=off", port, dir)
 	if out, err := exec.Command(pgctl, "-D", dataDir, "-w", "-t", "30",
 		"-o", opts, "-l", dir+"/postgres.log", "start").CombinedOutput(); err != nil {
 		log, _ := os.ReadFile(dir + "/postgres.log")
 		clusterErr = fmt.Errorf("pg_ctl start: %v\n%s\n%s", err, out, log)
-		return m.Run()
+		return requireOrRun(m)
 	}
 	defer func() {
 		_ = exec.Command(pgctl, "-D", dataDir, "-m", "immediate", "stop").Run()
@@ -108,4 +116,21 @@ func freePort() (int, error) {
 	}
 	defer l.Close()
 	return l.Addr().(*net.TCPAddr).Port, nil
+}
+
+// requireOrRun decides what a missing cluster means.
+//
+// Locally it means "skip the Postgres tests", which is a reasonable courtesy.
+// In CI it must mean failure: skipped tests report as passed, so a runner where
+// the cluster cannot start produces a green build that exercised almost nothing.
+// That is exactly what happened — a differential-fuzz job reported success
+// having run zero queries, because the cluster failed and every test skipped.
+//
+// Set KOR_REQUIRE_PG=1 anywhere the tests are expected to actually run.
+func requireOrRun(m *testing.M) int {
+	if os.Getenv("KOR_REQUIRE_PG") != "" {
+		fmt.Fprintf(os.Stderr, "pgtest: KOR_REQUIRE_PG is set but no cluster could be started: %v\n", clusterErr)
+		return 1
+	}
+	return m.Run()
 }

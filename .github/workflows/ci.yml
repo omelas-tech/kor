@@ -17,6 +17,10 @@ jobs:
       - run: go build ./...
       - run: go vet ./...
       - run: go test -race ./...
+        env:
+          # Skipped tests report as passed, so a runner without a working
+          # cluster would produce a green build that ran almost nothing.
+          KOR_REQUIRE_PG: "1"
 
   # G2: differential fuzz against Google's own Firestore emulator.
   #
@@ -57,4 +61,5 @@ jobs:
         env:
           KOR_FUZZ_EMULATOR: 127.0.0.1:8080
           KOR_FUZZ_SEED: ${{ github.run_number }}
+          KOR_REQUIRE_PG: "1"
         run: go test ./e2e/ -run TestFuzzAgainstFirestoreEmulator -count=1 -v

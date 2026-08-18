@@ -1,6 +1,6 @@
 # `kor` — command-line reference
 
-One binary, five subcommands:
+One binary, six subcommands:
 
 | | |
 |---|---|
@@ -9,6 +9,7 @@ One binary, five subcommands:
 | [`verify`](#kor-verify) | diff the two, document by document |
 | [`stats`](#kor-stats) | what Kor currently holds |
 | [`bench`](#kor-bench) | interleaved point-read latency, Kor vs Firestore |
+| [`index`](#kor-index) | register, backfill and inspect composite indexes |
 
 Flags shared by everything that talks to both stores:
 
@@ -156,3 +157,37 @@ shape, not a benchmark's.
 Treat it as the per-operation ground truth beneath any endpoint-level
 measurement — an endpoint blends caching, serialization and everything else, so
 when the two disagree, this is the one that isolates the store.
+
+
+---
+
+## `kor index`
+
+Registers, backfills and inspects composite indexes. Talks to Postgres
+directly rather than through kord: these are administrative acts on the store,
+not queries against it.
+
+```bash
+kor index apply    -pg-dsn "$KORD_PG_DSN" -file firestore.indexes.json [-collection a,b] [-all] [-dry-run]
+kor index list     -pg-dsn "$KORD_PG_DSN"
+kor index backfill -pg-dsn "$KORD_PG_DSN" [-spec '…'] [-force]
+kor index drop     -pg-dsn "$KORD_PG_DSN" -spec 'posts|author asc|score desc'
+```
+
+**`apply` registers; it does not enable.** A registered index holds entries only
+for documents written after registration, so serving reads from it would
+silently return fewer documents than the collection holds. `list` shows it as
+`PENDING` until a backfill completes.
+
+**`apply` defaults to the collections Kor actually holds** and refuses to run
+against an empty store. A project's `firestore.indexes.json` describes its whole
+Firestore; applying all of it to a store serving four collections registers
+indexes whose only effect is work on every write, with nothing able to read
+them.
+
+Array-contains and vector indexes in the file are skipped with a printed reason:
+they are different data structures, not orderings, and cannot be expressed as a
+sort-key range.
+
+kord re-reads the registry every 30 seconds, so all of this takes effect on a
+running server. Full detail: [indexes.md](indexes.md).

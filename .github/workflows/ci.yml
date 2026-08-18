@@ -17,3 +17,44 @@ jobs:
       - run: go build ./...
       - run: go vet ./...
       - run: go test -race ./...
+
+  # G2: differential fuzz against Google's own Firestore emulator.
+  #
+  # Separate from the unit job because it needs Java and a downloaded emulator,
+  # and because its failure means something different: the unit job says Kor
+  # broke its own contract, this one says Kor and Firestore disagree.
+  #
+  # The seed is derived from the run number rather than fixed, so successive CI
+  # runs explore different corpora instead of re-proving the same one. A failure
+  # prints its seed, and KOR_FUZZ_SEED reproduces it exactly.
+  firestore-differential:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Put PostgreSQL binaries on PATH (pgtest spins its own cluster)
+        run: echo "$(ls -d /usr/lib/postgresql/*/bin | head -1)" >> "$GITHUB_PATH"
+      - name: Install the Firestore emulator
+        run: npm install -g firebase-tools
+      - name: Start the emulator
+        run: |
+          nohup firebase emulators:start --only firestore --project demo-kor \
+            > /tmp/emulator.log 2>&1 &
+          for i in $(seq 1 60); do
+            if curl -sf -o /dev/null http://127.0.0.1:8080/; then
+              echo "emulator up"; exit 0
+            fi
+            sleep 2
+          done
+          echo "emulator did not start"; cat /tmp/emulator.log; exit 1
+      - name: Fuzz Kor against Firestore
+        env:
+          KOR_FUZZ_EMULATOR: 127.0.0.1:8080
+          KOR_FUZZ_SEED: ${{ github.run_number }}
+        run: go test ./e2e/ -run TestFuzzAgainstFirestoreEmulator -count=1 -v

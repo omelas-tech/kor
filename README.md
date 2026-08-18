@@ -79,8 +79,18 @@ production application's full API test suite passing against Kor unchanged):
   `-0.0`/`NaN`/`±Inf` doubles, bytes, references, geopoints, nested
   arrays/maps — property-tested round-trips
 - A sort-key encoding whose memcmp order equals Firestore's documented
-  cross-type ordering (the foundation for composite indexes), fuzz-verified
-  against a reference comparator
+  cross-type ordering, fuzz-verified against a reference comparator
+- **Composite indexes** (`index_entries`), maintained transactionally with the
+  document write and serving equality prefixes, inequality ranges, ordering and
+  cursors straight from key order — so `LIMIT`/`OFFSET` push into Postgres and
+  a paged query costs O(limit) rather than O(matching documents). Definitions
+  come from your existing `firestore.indexes.json`; see
+  [docs/indexes.md](docs/indexes.md)
+- **Differential fuzzing against Google's own Firestore emulator**: the same
+  corpus in both stores, thousands of generated queries per run, results and
+  order diffed, on both the general and the index path. It runs in CI with a
+  per-run seed, and it found four real divergences the hand-written tests had
+  agreed with — see [docs/differential-testing.md](docs/differential-testing.md)
 - **A reversible migration path**: `kor import` copies a collection in from a
   live Firestore project (resumable, byte-aware batching), `kor verify` diffs
   the two, and `kor export` replays it back out — rate-limited to stay inside
@@ -88,17 +98,25 @@ production application's full API test suite passing against Kor unchanged):
   one-way door: documents written after it exist only in Kor, so "point the app
   back at Firestore" silently loses them. Export replays writes, not deletes.
 
-Query execution note: Postgres narrows candidates (collection bounds, jsonb
+Query execution note: a query whose shape matches a backfilled composite index
+scans `index_entries` in key order — which is query order — so only the
+surviving page of documents is fetched. Everything else falls back to the
+general path, where Postgres narrows candidates (collection bounds, jsonb
 containment, `__name__`-ordered scans with cursor/limit pushdown) and full
-Firestore semantics are re-evaluated in Go. Composite `index_entries`
-execution for large hot query shapes is the next performance step — the
-semantics above are the reference implementation it must match.
+Firestore semantics are re-evaluated in Go. The general path is the reference
+implementation: the planner declines any shape it cannot serve exactly, and
+the index path is diffed against both it and the Google emulator.
+
+Honest gaps in the index path: `array-contains` and vector indexes are not
+served (they are different data structures, not orderings, and are skipped
+loudly when parsing your config), and the planner still declines disjunctions
+and a second inequality field.
 
 On the roadmap (in build order):
 
 | Phase | Scope |
 |---|---|
-| 1 (remaining) | Composite `index_entries` execution for hot query shapes; differential fuzzing vs the Google emulator |
+| 1 | ~~Composite `index_entries` execution~~, ~~differential fuzzing vs the Google emulator~~ — both shipped |
 | 2 | Change-log + functions runtime (runs `firebase-functions` v2 code unchanged) + cron scheduler |
 | 3 | Realtime: `Listen`/`Write` streams for the native mobile SDKs |
 | 4 | Security rules interpreter (`firestore.rules` verbatim) + Firebase Auth token verification |

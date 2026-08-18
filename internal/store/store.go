@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	pb "cloud.google.com/go/firestore/apiv1/firestorepb"
@@ -27,6 +28,9 @@ type Store struct {
 	Pool    *pgxpool.Pool
 	txns    txnRegistry
 	indexes indexRegistry
+	// indexedQueries counts queries served from index_entries. See
+	// IndexedQueries: registered and actually-used are different claims.
+	indexedQueries atomic.Int64
 }
 
 // Doc is a stored document.

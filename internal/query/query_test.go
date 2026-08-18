@@ -90,9 +90,16 @@ func TestFilterSemantics(t *testing.T) {
 		{"eq-cross-numeric",
 			fieldFilter("x", pb.StructuredQuery_FieldFilter_EQUAL, fv("double", 5.0)),
 			[]string{"int5", "dbl5"}},
-		{"neq-excludes-null-nan-missing",
+		// Expectations below were corrected against Google's Firestore emulator
+		// (see e2e.TestFuzzAgainstFirestoreEmulator). They previously asserted
+		// that != and not-in exclude NaN, which is what I assumed; Firestore
+		// excludes only null and a missing field, and lets NaN participate.
+		{"neq-excludes-null-and-missing-but-not-nan",
 			fieldFilter("x", pb.StructuredQuery_FieldFilter_NOT_EQUAL, fv("int", 5)),
-			[]string{"int9", "str", "arr"}},
+			[]string{"int9", "str", "arr", "nan"}},
+		{"eq-nan-matches-nan",
+			fieldFilter("x", pb.StructuredQuery_FieldFilter_EQUAL, fv("double", math.NaN())),
+			[]string{"nan"}},
 		{"in",
 			fieldFilter("x", pb.StructuredQuery_FieldFilter_IN,
 				fv("array", []*pb.Value{fv("int", 9), fv("string", "zzz")})),
@@ -101,10 +108,20 @@ func TestFilterSemantics(t *testing.T) {
 			fieldFilter("x", pb.StructuredQuery_FieldFilter_NOT_IN,
 				fv("array", []*pb.Value{fv("int", 5), fv("null", nil)})),
 			nil},
-		{"not-in",
+		{"not-in-excludes-null-and-missing-but-not-nan",
 			fieldFilter("x", pb.StructuredQuery_FieldFilter_NOT_IN,
 				fv("array", []*pb.Value{fv("int", 5)})),
-			[]string{"int9", "str", "arr"}},
+			[]string{"int9", "str", "arr", "nan"}},
+		// not-in is not the complement of in: `in [NaN]` matches nothing, yet
+		// `not-in [NaN]` excludes nothing, NaN included.
+		{"not-in-nan-excludes-nothing",
+			fieldFilter("x", pb.StructuredQuery_FieldFilter_NOT_IN,
+				fv("array", []*pb.Value{fv("double", math.NaN())})),
+			[]string{"int5", "dbl5", "int9", "str", "arr", "nan"}},
+		{"in-nan-matches-nothing",
+			fieldFilter("x", pb.StructuredQuery_FieldFilter_IN,
+				fv("array", []*pb.Value{fv("double", math.NaN())})),
+			nil},
 		{"array-contains",
 			fieldFilter("x", pb.StructuredQuery_FieldFilter_ARRAY_CONTAINS, fv("int", 5)),
 			[]string{"arr"}},

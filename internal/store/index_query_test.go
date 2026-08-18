@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"math"
 	"math/rand"
 	"testing"
 
@@ -376,5 +377,69 @@ func TestIndexedRandomizedAgainstGeneralPath(t *testing.T) {
 			continue // a shape the planner declines; the general path already serves it
 		}
 		t.Run(fmt.Sprintf("case%03d", i), func(t *testing.T) { bothWays(t, s, defs, q) })
+	}
+}
+
+// A range comparison applies only within the operand's type: `score > 4`
+// matches numbers, never the strings that sort after them in the total order.
+// An index range is bytes, so it spans type boundaries unless clamped — and the
+// seeded corpus above is all integers, which made this suite blind to it. The
+// emulator fuzz caught it; this keeps it caught without an emulator.
+func TestIndexedInequalityStaysInsideTheOperandType(t *testing.T) {
+	s := openStore(t)
+	ctx := context.Background()
+
+	d := index.Def{CollectionID: "mixed", Fields: []index.Field{{Path: "v"}}}
+	dDesc := index.Def{CollectionID: "mixed", Fields: []index.Field{{Path: "v", Desc: true}}}
+	defs := []index.Def{d, dDesc}
+	if err := s.SetIndexes(ctx, defs); err != nil {
+		t.Fatal(err)
+	}
+
+	// One document per type bucket, spanning the whole order.
+	vals := []*pb.Value{
+		{ValueType: &pb.Value_NullValue{}},
+		{ValueType: &pb.Value_BooleanValue{BooleanValue: true}},
+		{ValueType: &pb.Value_DoubleValue{DoubleValue: math.NaN()}},
+		ival(-5), ival(0), ival(7), {ValueType: &pb.Value_DoubleValue{DoubleValue: 7.5}},
+		sval(""), sval("m"), sval("zzz"),
+		{ValueType: &pb.Value_BytesValue{BytesValue: []byte{0x01}}},
+	}
+	for i, v := range vals {
+		setDoc(t, s, fmt.Sprintf("%s/mixed/m%02d", idxParent, i), map[string]*pb.Value{"v": v})
+	}
+	for _, def := range defs {
+		if _, err := s.BackfillIndex(ctx, def); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ops := []pb.StructuredQuery_FieldFilter_Operator{
+		pb.StructuredQuery_FieldFilter_GREATER_THAN,
+		pb.StructuredQuery_FieldFilter_GREATER_THAN_OR_EQUAL,
+		pb.StructuredQuery_FieldFilter_LESS_THAN,
+		pb.StructuredQuery_FieldFilter_LESS_THAN_OR_EQUAL,
+	}
+	operands := map[string]*pb.Value{
+		"int":    ival(0),
+		"double": {ValueType: &pb.Value_DoubleValue{DoubleValue: 7.5}},
+		"string": sval("m"),
+		"bool":   {ValueType: &pb.Value_BooleanValue{BooleanValue: true}},
+		"nan":    {ValueType: &pb.Value_DoubleValue{DoubleValue: math.NaN()}},
+	}
+	for _, dir := range []pb.StructuredQuery_Direction{
+		pb.StructuredQuery_ASCENDING, pb.StructuredQuery_DESCENDING,
+	} {
+		for name, operand := range operands {
+			for _, op := range ops {
+				t.Run(fmt.Sprintf("%s/%v/%v", name, op, dir), func(t *testing.T) {
+					bothWays(t, s, defs, mkQuery(t, &pb.StructuredQuery{
+						From:    from("mixed"),
+						Where:   cmpFilter("v", op, operand),
+						OrderBy: []*pb.StructuredQuery_Order{orderBy("v", dir)},
+					}))
+				})
+			}
+		}
 	}
 }

@@ -195,6 +195,20 @@ func bounds(d Def, eqCount int, prefix []byte, reversed bool, q *query.Query) (l
 	fieldDesc := fields[eqCount].Desc
 
 	if _, ineq, valid := splitFilters(q); valid && ineq != nil {
+		// A range comparison applies only within the operand's type. Without
+		// this clamp the scan spans type boundaries and returns, say, strings
+		// for `score > 4` — which runIndexed's re-check catches as an error
+		// rather than a wrong answer, but only because that check exists.
+		// NaN needs no special case: it carries its own type tag, so a numeric
+		// operand's bucket already excludes it.
+		bucket := append(append([]byte(nil), prefix...), value.TypeBucket(nil, ineq.value, fieldDesc)...)
+		lo = maxBound(lo, bucket)
+		hi = minBound(hi, PrefixEnd(bucket))
+		if value.IsNaN(ineq.value) {
+			// NaN matches no inequality on either side, so the range is empty.
+			return lo, lo, true
+		}
+
 		k := cursorKey(d, eqCount, prefix, []*pb.Value{ineq.value})
 		switch ineq.op {
 		case gt:

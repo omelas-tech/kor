@@ -77,7 +77,19 @@ func Parse(parent string, sq *pb.StructuredQuery) (*Query, error) {
 	// Explicit ordering.
 	nameOrdered := false
 	lastDir := Asc
+	// Firestore rejects a duplicated orderBy field ("order by clause cannot
+	// contain duplicate fields x"). Accepting it would make Kor quietly more
+	// permissive than the API it implements: a client that works against Kor
+	// would then fail against Firestore, which is the direction of divergence
+	// that hurts most in a migration.
+	seenOrder := map[string]bool{}
 	for _, ob := range sq.GetOrderBy() {
+		if fp := ob.GetField().GetFieldPath(); seenOrder[fp] {
+			return nil, status.Errorf(codes.InvalidArgument,
+				"order by clause cannot contain duplicate fields %s", fp)
+		} else {
+			seenOrder[fp] = true
+		}
 		dir := Asc
 		if ob.GetDirection() == pb.StructuredQuery_DESCENDING {
 			dir = Desc
@@ -312,14 +324,20 @@ func evalFieldFilter(ff *pb.StructuredQuery_FieldFilter, name string, fields map
 
 	switch op {
 	case pb.StructuredQuery_FieldFilter_EQUAL:
-		if value.IsNaN(operand) || value.IsNaN(v) {
-			return false // NaN equals nothing in filters
-		}
+		// NaN is NOT the IEEE NaN here. Firestore's emulator answers
+		// `where a == NaN` with the documents holding NaN, so equality treats
+		// NaN as a single self-equal value — which is also what makes it
+		// orderable at all. Compare already collapses NaN to NaN, so this is
+		// just the comparison.
 		return value.Compare(v, operand) == 0
 
 	case pb.StructuredQuery_FieldFilter_NOT_EQUAL:
-		// Matches existing, non-null, non-NaN values different from operand.
-		if value.IsNull(v) || value.IsNaN(v) {
+		// Excludes a missing field and an explicit null, but NOT NaN: the
+		// emulator answers `where a != 5` with the NaN document included, and
+		// `where a != NaN` with it excluded. So NaN participates normally and
+		// only null is special. (Verified against the emulator; the previous
+		// code excluded NaN and silently dropped documents.)
+		if value.IsNull(v) {
 			return false
 		}
 		return value.Compare(v, operand) != 0
@@ -346,6 +364,14 @@ func evalFieldFilter(ff *pb.StructuredQuery_FieldFilter, name string, fields map
 
 	case pb.StructuredQuery_FieldFilter_IN:
 		for _, el := range operand.GetArrayValue().GetValues() {
+			if value.IsNull(el) {
+				// A null in the in-list matches nothing, not even a null field
+				// — the same asymmetry NOT_IN already has, and the opposite of
+				// `field == null`, which does match. Confirmed against the
+				// Firestore emulator, which returns no documents for
+				// `where a in [null, 1]` that hold null.
+				continue
+			}
 			if !value.IsNaN(el) && !value.IsNaN(v) && value.Compare(v, el) == 0 {
 				return true
 			}
@@ -353,12 +379,18 @@ func evalFieldFilter(ff *pb.StructuredQuery_FieldFilter, name string, fields map
 		return false
 
 	case pb.StructuredQuery_FieldFilter_NOT_IN:
-		if value.IsNull(v) || value.IsNaN(v) {
-			return false
+		if value.IsNull(v) {
+			return false // as with !=, null and a missing field are excluded
 		}
 		for _, el := range operand.GetArrayValue().GetValues() {
 			if value.IsNull(el) {
 				return false // a null in the not-in list matches nothing
+			}
+			if value.IsNaN(el) {
+				// not-in is not the complement of in: `in [NaN]` matches
+				// nothing, yet `not-in [NaN]` excludes nothing — including the
+				// NaN document itself, which the emulator returns.
+				continue
 			}
 			if value.Compare(v, el) == 0 {
 				return false

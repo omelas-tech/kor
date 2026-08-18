@@ -359,3 +359,10 @@ func (s *Store) CollectionsWithDocuments(ctx context.Context) (map[string]bool, 
 	}
 	return out, rows.Err()
 }
+
+// IndexedQueries counts queries served from index_entries rather than the
+// general path. Exposed because "the index is registered" and "the index is
+// being used" are different claims, and only the second one matters: a test or
+// a dashboard that cannot tell them apart will report success while every query
+// quietly falls back.
+func (s *Store) IndexedQueries() int64 { return s.indexedQueries.Load() }

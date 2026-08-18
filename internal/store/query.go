@@ -287,16 +287,34 @@ func equalityProbes(path value.FieldPath, operand *pb.Value, build func(value.Fi
 	add(operand)
 	// Firestore numeric equality crosses int64/double; probe both encodings
 	// when the operand is exactly representable in the other type.
+	//
+	// Zero needs a third probe. The tagged encoding preserves the sign of a
+	// double zero ("-0" is a distinct string from "0"), because a round trip
+	// must return exactly what was written. Firestore equality does not
+	// distinguish them — and neither do Compare or the sortkey, which both
+	// collapse -0.0 to +0.0 — so containment is the one place the two
+	// spellings can drift apart. Probing only the operand's own spelling makes
+	// `where x == 0` miss every document that stored -0.0, and vice versa.
+	//
+	// Found by the differential fuzz against Firestore's emulator, not by
+	// reasoning: `a == -0` returned one document where Firestore returned three.
 	switch t := operand.GetValueType().(type) {
 	case *pb.Value_IntegerValue:
 		f := float64(t.IntegerValue)
 		if int64(f) == t.IntegerValue && f != math.MaxInt64 {
 			add(&pb.Value{ValueType: &pb.Value_DoubleValue{DoubleValue: f}})
 		}
+		if t.IntegerValue == 0 {
+			add(&pb.Value{ValueType: &pb.Value_DoubleValue{DoubleValue: math.Copysign(0, -1)}})
+		}
 	case *pb.Value_DoubleValue:
 		f := t.DoubleValue
 		if f == math.Trunc(f) && f >= math.MinInt64 && f < math.MaxInt64 {
 			add(&pb.Value{ValueType: &pb.Value_IntegerValue{IntegerValue: int64(f)}})
+		}
+		if f == 0 {
+			add(&pb.Value{ValueType: &pb.Value_DoubleValue{DoubleValue: 0}})
+			add(&pb.Value{ValueType: &pb.Value_DoubleValue{DoubleValue: math.Copysign(0, -1)}})
 		}
 	}
 	if len(group) == 0 {
@@ -340,6 +358,7 @@ func scanDoc(rows interface {
 // planner bug into a quietly short result set, which is the failure mode this
 // whole design exists to avoid.
 func (s *Store) runIndexed(ctx context.Context, q *query.Query, plan *index.Plan, yield func(*Doc) error) error {
+	s.indexedQueries.Add(1)
 	lo, hi := plan.Lo, plan.Hi
 
 	order := "ASC"

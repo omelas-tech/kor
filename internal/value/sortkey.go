@@ -242,3 +242,26 @@ func complement(b []byte) {
 		b[i] ^= 0xFF
 	}
 }
+
+// TypeBucket appends the single type-tag byte that every sort key of v's type
+// begins with, complemented when the field is encoded descending.
+//
+// It exists because Firestore range comparisons apply only WITHIN a type: `x >
+// 4` matches numbers, never the strings that sort after them. The general path
+// enforces that with an explicit TypeOrder check; an index range has to enforce
+// it in bytes, by clamping the scan to [tag, PrefixEnd(tag)).
+//
+// The tag is read back off a real encoding rather than duplicated from the
+// switch that writes it, so the two cannot drift apart.
+func TypeBucket(dst []byte, v *pb.Value, desc bool) []byte {
+	var k []byte
+	if desc {
+		k = AppendSortKeyDesc(nil, v)
+	} else {
+		k = AppendSortKey(nil, v)
+	}
+	if len(k) == 0 {
+		return dst
+	}
+	return append(dst, k[0])
+}

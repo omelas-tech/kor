@@ -37,8 +37,11 @@ for server SDKs and tests, or the SDK's custom-host setting for production use
 Kor also makes a pleasant **persistent local emulator**: unlike the official
 emulator, data survives restarts and lives in a database you can inspect with SQL.
 
-> **Security note:** kord currently has no authentication (like the emulator).
-> Keep it on loopback or a private network. See [SECURITY.md](SECURITY.md).
+> **Security note:** kord currently has no authentication (like the emulator),
+> so anything that can reach the port has full read/write on every document.
+> It therefore **refuses to start on a non-loopback address** unless you pass
+> `-i-know-this-is-unauthenticated`. Keep it on loopback or a private network.
+> See [SECURITY.md](SECURITY.md).
 
 ## Why
 

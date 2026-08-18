@@ -24,8 +24,9 @@ var migrationsFS embed.FS
 
 // Store wraps a Postgres pool holding Kor's document data.
 type Store struct {
-	Pool *pgxpool.Pool
-	txns txnRegistry
+	Pool    *pgxpool.Pool
+	txns    txnRegistry
+	indexes indexRegistry
 }
 
 // Doc is a stored document.
@@ -297,9 +298,15 @@ func (s *Store) applyCommit(ctx context.Context, ws []*pb.Write, extraLocks []st
 				ON CONFLICT DO NOTHING`, p.ParentPath, p.CollectionID); err != nil {
 				return nil, time.Time{}, fmt.Errorf("store: register collection: %w", err)
 			}
+			if err := s.refreshIndexEntries(ctx, tx, name, p.CollectionID, st.Fields, false); err != nil {
+				return nil, time.Time{}, err
+			}
 		} else {
 			if _, err := tx.Exec(ctx, `DELETE FROM documents WHERE name = $1`, name); err != nil {
 				return nil, time.Time{}, fmt.Errorf("store: delete %s: %w", name, err)
+			}
+			if err := s.refreshIndexEntries(ctx, tx, name, paths[name].CollectionID, nil, true); err != nil {
+				return nil, time.Time{}, err
 			}
 		}
 	}

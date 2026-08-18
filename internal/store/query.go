@@ -9,6 +9,7 @@ import (
 
 	pb "cloud.google.com/go/firestore/apiv1/firestorepb"
 
+	"github.com/omelas-tech/kor/internal/index"
 	"github.com/omelas-tech/kor/internal/query"
 	"github.com/omelas-tech/kor/internal/value"
 )
@@ -45,6 +46,15 @@ func (s *Store) RunQuery(ctx context.Context, q *query.Query, yield func(*Doc) e
 	dir, nameOnly := q.NameOnlyOrder()
 	if nameOnly {
 		return s.runNameOrdered(ctx, q, where, args, dir, yield)
+	}
+	// A composite index serves this only if one exists, is backfilled, and
+	// covers the shape exactly. Anything else falls back to runGeneral, which
+	// remains the reference implementation — every shape the planner declines
+	// is a performance opportunity, never a correctness risk.
+	if defs := s.indexes.forCollection(q.CollectionID); len(defs) > 0 {
+		if plan, ok := index.For(q, defs, s.indexes.readySet()); ok {
+			return s.runIndexed(ctx, q, plan, yield)
+		}
 	}
 	return s.runGeneral(ctx, q, where, args, yield)
 }
@@ -312,4 +322,92 @@ func scanDoc(rows interface {
 		return nil, fmt.Errorf("store: document %s: %w", name, err)
 	}
 	return &Doc{Name: name, Fields: fields, CreateTime: createTime.UTC(), UpdateTime: updateTime.UTC()}, nil
+}
+
+// runIndexed streams a query from a composite index.
+//
+// The scan walks index_entries in key order, which is exactly query order, so
+// Postgres applies OFFSET and LIMIT and only the surviving documents are
+// fetched. That is the whole point: cost becomes O(limit) instead of O(matching
+// documents).
+//
+// Every fetched document is still re-checked with q.Matches. On a correct plan
+// that check never fails — the index prefix already encodes the equality
+// filters — so it is an assertion, not filtering. It is affordable precisely
+// because only the limit-sized page is fetched, and a failure means the planner
+// chose an index that does not actually serve the query. That is returned as an
+// error rather than silently skipped: dropping the document would turn a
+// planner bug into a quietly short result set, which is the failure mode this
+// whole design exists to avoid.
+func (s *Store) runIndexed(ctx context.Context, q *query.Query, plan *index.Plan, yield func(*Doc) error) error {
+	lo := plan.Prefix
+	hi := index.PrefixEnd(lo)
+
+	order := "ASC"
+	if plan.Reversed {
+		order = "DESC"
+	}
+
+	args := []any{plan.Def.ID(), lo}
+	sql := `SELECT e.doc_name FROM index_entries e WHERE e.index_id = $1 AND e.key >= $2`
+	if hi != nil {
+		args = append(args, hi)
+		sql += fmt.Sprintf(" AND e.key < $%d", len(args))
+	}
+	sql += " ORDER BY e.key " + order
+	if q.Limit >= 0 {
+		args = append(args, int64(q.Limit))
+		sql += fmt.Sprintf(" LIMIT $%d", len(args))
+	}
+	if q.Offset > 0 {
+		args = append(args, int64(q.Offset))
+		sql += fmt.Sprintf(" OFFSET $%d", len(args))
+	}
+
+	rows, err := s.Pool.Query(ctx, sql, args...)
+	if err != nil {
+		return fmt.Errorf("store: index scan: %w", err)
+	}
+	var names []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			rows.Close()
+			return err
+		}
+		names = append(names, n)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(names) == 0 {
+		return nil
+	}
+
+	docs, err := s.GetDocuments(ctx, names)
+	if err != nil {
+		return err
+	}
+	for _, n := range names {
+		doc, ok := docs[n]
+		if !ok {
+			// An entry without its document means maintenance and the document
+			// write diverged, which the shared transaction is supposed to make
+			// impossible.
+			return fmt.Errorf("store: index %s references missing document %s",
+				index.EncodeID(plan.Def.ID()), n)
+		}
+		if !q.Matches(doc.Name, doc.Fields) {
+			return fmt.Errorf("store: index %s returned %s which does not match the query — planner chose an index that does not serve it",
+				index.EncodeID(plan.Def.ID()), n)
+		}
+		if err := yield(doc); err != nil {
+			if err == ErrStop {
+				return nil
+			}
+			return err
+		}
+	}
+	return nil
 }

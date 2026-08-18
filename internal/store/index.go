@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/omelas-tech/kor/internal/index"
+	"github.com/omelas-tech/kor/internal/value"
 )
 
 // Index registry and entry maintenance.
@@ -20,12 +21,32 @@ import (
 type indexRegistry struct {
 	mu     sync.RWMutex
 	byColl map[string][]index.Def
+	// ready is cached in memory: readiness changes only via MarkIndexReady or
+	// a restart, and querying index_defs per query would put a database
+	// round-trip on the hot path — which is precisely the cost this whole
+	// feature exists to remove.
+	ready map[int64]bool
 }
 
 func (r *indexRegistry) forCollection(collectionID string) []index.Def {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.byColl[collectionID]
+}
+
+func (r *indexRegistry) readySet() map[int64]bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.ready
+}
+
+func (r *indexRegistry) markReady(id int64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.ready == nil {
+		r.ready = map[int64]bool{}
+	}
+	r.ready[id] = true
 }
 
 // SetIndexes replaces the in-memory registry and records each definition in
@@ -57,8 +78,14 @@ func (s *Store) SetIndexes(ctx context.Context, defs []index.Def) error {
 		}
 	}
 
+	ready, err := s.ReadyIndexes(ctx)
+	if err != nil {
+		return fmt.Errorf("store: load index readiness: %w", err)
+	}
+
 	s.indexes.mu.Lock()
 	s.indexes.byColl = byColl
+	s.indexes.ready = ready
 	s.indexes.mu.Unlock()
 	return nil
 }
@@ -111,9 +138,79 @@ func (s *Store) refreshIndexEntries(ctx context.Context, tx pgx.Tx, name, collec
 // reads. Separate from registration on purpose: the gap between the two is
 // exactly the window in which the index exists but is incomplete.
 func (s *Store) MarkIndexReady(ctx context.Context, d index.Def) error {
-	_, err := s.Pool.Exec(ctx,
-		`UPDATE index_defs SET ready_at = now() WHERE index_id = $1`, d.ID())
-	return err
+	if _, err := s.Pool.Exec(ctx,
+		`UPDATE index_defs SET ready_at = now() WHERE index_id = $1`, d.ID()); err != nil {
+		return err
+	}
+	s.indexes.markReady(d.ID())
+	return nil
+}
+
+// BackfillIndex populates an index from the documents already stored, then
+// marks it ready.
+//
+// Until this runs, an index holds entries only for documents written since it
+// was registered — so it is missing most of the collection while looking
+// perfectly healthy. Readiness is set only at the end, and only on success:
+// a partial backfill must never leave an index eligible for reads.
+func (s *Store) BackfillIndex(ctx context.Context, d index.Def) (int64, error) {
+	rows, err := s.Pool.Query(ctx,
+		`SELECT name, data FROM documents WHERE collection_id = $1 ORDER BY name`, d.CollectionID)
+	if err != nil {
+		return 0, fmt.Errorf("store: backfill scan: %w", err)
+	}
+	type pending struct {
+		name string
+		key  []byte
+	}
+	var batch []pending
+	for rows.Next() {
+		var name string
+		var raw []byte
+		if err := rows.Scan(&name, &raw); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		fields, err := value.UnmarshalFields(raw)
+		if err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("store: backfill decode %s: %w", name, err)
+		}
+		if key, ok := d.Key(name, fields); ok {
+			batch = append(batch, pending{name, key})
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Clear first: a re-run after a definition change or a partial attempt must
+	// not merge old entries with new ones.
+	if _, err := tx.Exec(ctx, `DELETE FROM index_entries WHERE index_id = $1`, d.ID()); err != nil {
+		return 0, fmt.Errorf("store: backfill clear: %w", err)
+	}
+	for _, e := range batch {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO index_entries (index_id, key, doc_name) VALUES ($1, $2, $3)
+			ON CONFLICT DO NOTHING`, d.ID(), e.key, e.name); err != nil {
+			return 0, fmt.Errorf("store: backfill insert %s: %w", e.name, err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("store: backfill commit: %w", err)
+	}
+
+	if err := s.MarkIndexReady(ctx, d); err != nil {
+		return 0, err
+	}
+	return int64(len(batch)), nil
 }
 
 // ReadyIndexes returns the ids of indexes that have completed a backfill.

@@ -240,3 +240,122 @@ func (s *Store) CountIndexEntries(ctx context.Context, d index.Def) (int64, erro
 		`SELECT count(*) FROM index_entries WHERE index_id = $1`, d.ID()).Scan(&n)
 	return n, err
 }
+
+// LoadIndexes rebuilds the in-memory registry from index_defs.
+//
+// Postgres is the source of truth at runtime, not a config file on the server:
+// the CLI registers and backfills definitions, and kord picks them up here. That
+// keeps the activation of an index — which must not happen before its backfill
+// completes — a property of the database rather than of which file a process
+// happened to read at boot.
+//
+// A malformed spec is skipped rather than fatal. Refusing to start because one
+// row cannot be parsed would take the whole store down for a problem that costs
+// only a missed optimisation.
+func (s *Store) LoadIndexes(ctx context.Context) (int, error) {
+	rows, err := s.Pool.Query(ctx, `SELECT spec, ready_at IS NOT NULL FROM index_defs`)
+	if err != nil {
+		return 0, fmt.Errorf("store: load index defs: %w", err)
+	}
+	defer rows.Close()
+
+	byColl := map[string][]index.Def{}
+	ready := map[int64]bool{}
+	bad := 0
+	for rows.Next() {
+		var spec string
+		var isReady bool
+		if err := rows.Scan(&spec, &isReady); err != nil {
+			return 0, err
+		}
+		d, err := index.ParseSpec(spec)
+		if err != nil {
+			bad++
+			continue
+		}
+		byColl[d.CollectionID] = append(byColl[d.CollectionID], d)
+		if isReady {
+			ready[d.ID()] = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	s.indexes.mu.Lock()
+	s.indexes.byColl = byColl
+	s.indexes.ready = ready
+	s.indexes.mu.Unlock()
+
+	if bad > 0 {
+		return len(ready), fmt.Errorf("store: %d index definition(s) could not be parsed and were ignored", bad)
+	}
+	return len(ready), nil
+}
+
+// DropIndex removes a definition and every entry it produced.
+//
+// Entries are deleted first: an index_defs row without entries is merely
+// unusable, while entries without a definition are unreachable rows that keep
+// paying write cost on every document change with nothing able to read them.
+func (s *Store) DropIndex(ctx context.Context, d index.Def) (int64, error) {
+	tag, err := s.Pool.Exec(ctx, `DELETE FROM index_entries WHERE index_id = $1`, d.ID())
+	if err != nil {
+		return 0, fmt.Errorf("store: drop index entries: %w", err)
+	}
+	if _, err := s.Pool.Exec(ctx, `DELETE FROM index_defs WHERE index_id = $1`, d.ID()); err != nil {
+		return 0, fmt.Errorf("store: drop index def: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
+// IndexStatus is one row of `kor index list`.
+type IndexStatus struct {
+	Spec    string
+	Ready   bool
+	Entries int64
+}
+
+// ListIndexes reports every registered definition with its entry count.
+func (s *Store) ListIndexes(ctx context.Context) ([]IndexStatus, error) {
+	rows, err := s.Pool.Query(ctx, `
+		SELECT d.spec, d.ready_at IS NOT NULL,
+		       (SELECT count(*) FROM index_entries e WHERE e.index_id = d.index_id)
+		FROM index_defs d ORDER BY d.collection_id, d.spec`)
+	if err != nil {
+		return nil, fmt.Errorf("store: list indexes: %w", err)
+	}
+	defer rows.Close()
+	var out []IndexStatus
+	for rows.Next() {
+		var st IndexStatus
+		if err := rows.Scan(&st.Spec, &st.Ready, &st.Entries); err != nil {
+			return nil, err
+		}
+		out = append(out, st)
+	}
+	return out, rows.Err()
+}
+
+// CollectionsWithDocuments lists the collections Kor actually holds.
+//
+// `kor index apply` uses this to avoid registering the whole of a project's
+// firestore.indexes.json against a store serving a handful of collections.
+// Every registered index costs work on every write to its collection, so an
+// index for a collection Kor does not serve is pure write amplification.
+func (s *Store) CollectionsWithDocuments(ctx context.Context) (map[string]bool, error) {
+	rows, err := s.Pool.Query(ctx, `SELECT DISTINCT collection_id FROM documents`)
+	if err != nil {
+		return nil, fmt.Errorf("store: list collections: %w", err)
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var c string
+		if err := rows.Scan(&c); err != nil {
+			return nil, err
+		}
+		out[c] = true
+	}
+	return out, rows.Err()
+}

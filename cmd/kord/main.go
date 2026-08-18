@@ -23,6 +23,11 @@ import (
 	"github.com/omelas-tech/kor/internal/store"
 )
 
+// indexReloadInterval trades staleness for load. Index changes are rare and
+// administrative, so a few seconds of lag costs nothing, while the query itself
+// is one small read against a table with a handful of rows.
+const indexReloadInterval = 30 * time.Second
+
 func main() {
 	listen := flag.String("listen", envOr("KORD_LISTEN", "127.0.0.1:6565"), "address to serve gRPC on")
 	dsn := flag.String("pg-dsn", os.Getenv("KORD_PG_DSN"), "PostgreSQL DSN (required)")
@@ -73,6 +78,35 @@ func main() {
 		os.Exit(1)
 	}
 	defer st.Close()
+
+	// Composite index definitions live in Postgres, so the CLI can register and
+	// backfill them against a running server. Reloading on a ticker rather than
+	// only at boot means enabling an index does not require a restart — and,
+	// more importantly, that a backfill finishing elsewhere takes effect on its
+	// own, instead of leaving an index that is complete in the database but
+	// still considered pending here.
+	//
+	// A failure to load is logged, not fatal: indexes are an optimisation, and
+	// the general query path serves every query correctly without them.
+	if n, err := st.LoadIndexes(ctx); err != nil {
+		log.Warn("loading composite indexes", "err", err, "ready", n)
+	} else if n > 0 {
+		log.Info("composite indexes loaded", "ready", n)
+	}
+	go func() {
+		t := time.NewTicker(indexReloadInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if _, err := st.LoadIndexes(ctx); err != nil {
+					log.Warn("reloading composite indexes", "err", err)
+				}
+			}
+		}
+	}()
 
 	lis, err := net.Listen("tcp", *listen)
 	if err != nil {

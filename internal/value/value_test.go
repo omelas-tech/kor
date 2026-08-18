@@ -15,7 +15,7 @@ import (
 
 // --- generators ---------------------------------------------------------
 
-func null() *pb.Value    { return &pb.Value{ValueType: &pb.Value_NullValue{}} }
+func null() *pb.Value { return &pb.Value{ValueType: &pb.Value_NullValue{}} }
 func vbool(b bool) *pb.Value {
 	return &pb.Value{ValueType: &pb.Value_BooleanValue{BooleanValue: b}}
 }

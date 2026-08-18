@@ -41,6 +41,8 @@ func main() {
 		runVerify(os.Args[2:])
 	case "stats":
 		runStats(os.Args[2:])
+	case "index":
+		runIndex(os.Args[2:])
 	case "bench":
 		runBench(os.Args[2:])
 	default:
@@ -49,7 +51,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: kor <import|export|verify|stats|bench> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: kor <import|export|verify|stats|bench|index> [flags]")
 	os.Exit(2)
 }
 

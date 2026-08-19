@@ -312,11 +312,17 @@ func (s *Store) applyCommit(ctx context.Context, ws []*pb.Write, extraLocks []st
 			if err := s.refreshIndexEntries(ctx, tx, name, p.CollectionID, st.Fields, false); err != nil {
 				return nil, time.Time{}, err
 			}
+			if err := appendChange(ctx, tx, name, p.CollectionID, "write"); err != nil {
+				return nil, time.Time{}, err
+			}
 		} else {
 			if _, err := tx.Exec(ctx, `DELETE FROM documents WHERE name = $1`, name); err != nil {
 				return nil, time.Time{}, fmt.Errorf("store: delete %s: %w", name, err)
 			}
 			if err := s.refreshIndexEntries(ctx, tx, name, paths[name].CollectionID, nil, true); err != nil {
+				return nil, time.Time{}, err
+			}
+			if err := appendChange(ctx, tx, name, paths[name].CollectionID, "delete"); err != nil {
 				return nil, time.Time{}, err
 			}
 		}

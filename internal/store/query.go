@@ -60,8 +60,10 @@ func (s *Store) RunQuery(ctx context.Context, q *query.Query, yield func(*Doc) e
 		}
 	}
 	if dir, nameOnly := q.NameOnlyOrder(); nameOnly {
+		queryPath.WithLabelValues("name").Inc()
 		return s.runNameOrdered(ctx, q, where, args, dir, yield)
 	}
+	queryPath.WithLabelValues("general").Inc()
 	return s.runGeneral(ctx, q, where, args, yield)
 }
 
@@ -365,11 +367,14 @@ func scanDoc(rows interface {
 // whole design exists to avoid.
 func (s *Store) runIndexed(ctx context.Context, q *query.Query, plan *index.Plan, yield func(*Doc) error) error {
 	s.indexedQueries.Add(1)
+	queryPath.WithLabelValues("indexed").Inc()
 	if len(plan.Ranges) > 1 {
 		s.indexedMerged.Add(1)
+		queryPath.WithLabelValues("merged").Inc()
 	}
 	if _, ok := plan.Def.ContainsPath(); ok {
 		s.indexedContains.Add(1)
+		queryPath.WithLabelValues("contains").Inc()
 	}
 
 	names, err := s.scanIndex(ctx, q, plan)

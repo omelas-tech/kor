@@ -40,9 +40,12 @@ func TestPartialGinUsability(t *testing.T) {
 	}
 	// Positive list: proving `collection_id = 'artworks'` implies membership is
 	// the easiest form for the planner. A NOT IN exclusion is harder still.
+	// Exclusion is the natural config shape ("these mirrors do not need it"),
+	// but it is the harder proof: the planner must show `collection_id = 'x'`
+	// implies `x` is none of the excluded constants.
 	if _, err := s.Pool.Exec(ctx, `
 		CREATE INDEX documents_gin_partial ON documents USING gin (data jsonb_path_ops)
-		WHERE collection_id IN ('artworks','artists','articles')`); err != nil {
+		WHERE collection_id NOT IN ('tmdb_movies_v3','tmdb_tv_series_v3','tmdb_persons_v3')`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.Pool.Exec(ctx, `ANALYZE documents`); err != nil {

@@ -30,13 +30,15 @@ func runIndex(args []string) {
 		runIndexBackfill(args[1:])
 	case "drop":
 		runIndexDrop(args[1:])
+	case "containment":
+		runIndexContainment(args[1:])
 	default:
 		indexUsage()
 	}
 }
 
 func indexUsage() {
-	fmt.Fprintln(os.Stderr, "usage: kor index <apply|list|backfill|drop> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: kor index <apply|list|backfill|drop|containment> [flags]")
 	os.Exit(2)
 }
 
@@ -248,4 +250,60 @@ func runIndexDrop(args []string) {
 		fatal("%v", err)
 	}
 	fmt.Printf("dropped %s (%d entries removed)\n", d.Spec(), n)
+}
+
+// runIndexContainment manages which collections are covered by the containment
+// index — the one that approximates Firestore's automatic single-field indexes,
+// and the one that dominates write cost.
+func runIndexContainment(args []string) {
+	fs := flag.NewFlagSet("index containment", flag.ExitOnError)
+	dsn := fs.String("pg-dsn", os.Getenv("KORD_PG_DSN"), "PostgreSQL DSN (required)")
+	exclude := fs.String("exclude", "", "comma-separated collections to exempt (replaces the current set)")
+	clear := fs.Bool("clear", false, "exempt nothing: index every collection")
+	_ = fs.Parse(args)
+
+	ctx := context.Background()
+	s := openAdminStore(ctx, *dsn)
+	defer s.Close()
+
+	show := func() {
+		current, err := s.ContainmentExclusions(ctx)
+		if err != nil {
+			fatal("%v", err)
+		}
+		pred, err := s.ContainmentIndexPredicate(ctx)
+		if err != nil {
+			fatal("%v", err)
+		}
+		if len(current) == 0 {
+			fmt.Println("exempt: (none) — every collection is in the containment index")
+		} else {
+			fmt.Printf("exempt: %s\n", strings.Join(current, ", "))
+		}
+		if pred == "" {
+			fmt.Println("index:  covers all collections")
+		} else {
+			fmt.Printf("index:  %s\n", pred)
+		}
+	}
+
+	if *exclude == "" && !*clear {
+		show()
+		fmt.Println("\nPass -exclude a,b,c to exempt collections, or -clear to cover everything.")
+		fmt.Println("Exempting a collection removes ~90% of its write cost and makes its" +
+			" equality filters scan instead of probing an index. Results do not change.")
+		return
+	}
+
+	var want []string
+	if !*clear {
+		want = strings.Split(*exclude, ",")
+	}
+	fmt.Println("rebuilding the containment index — CONCURRENTLY, so writes keep working")
+	if err := s.SetContainmentExclusions(ctx, want, func(msg string) {
+		fmt.Println("  " + msg)
+	}); err != nil {
+		fatal("%v", err)
+	}
+	show()
 }

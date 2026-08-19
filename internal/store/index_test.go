@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	pb "cloud.google.com/go/firestore/apiv1/firestorepb"
@@ -229,5 +230,71 @@ func TestDropIndexRemovesEntriesAndDefinition(t *testing.T) {
 	}
 	if len(rows) != 0 {
 		t.Errorf("definition survived the drop: %+v", rows)
+	}
+}
+
+// DropCollection is the undo for a bad import, so the property that matters is
+// containment: it removes the named collection completely — documents, index
+// entries and registry row — and touches nothing else.
+func TestDropCollectionRemovesOnlyItsOwnData(t *testing.T) {
+	s := openStore(t)
+	ctx := context.Background()
+
+	doomed := index.Def{CollectionID: "doomed", Fields: []index.Field{{Path: "v"}}}
+	keeper := index.Def{CollectionID: "keeper", Fields: []index.Field{{Path: "v"}}}
+	if err := s.SetIndexes(ctx, []index.Def{doomed, keeper}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 25; i++ {
+		setDoc(t, s, fmt.Sprintf("%s/doomed/d%02d", idxParent, i), map[string]*pb.Value{"v": ival(int64(i))})
+	}
+	for i := 0; i < 7; i++ {
+		setDoc(t, s, fmt.Sprintf("%s/keeper/k%02d", idxParent, i), map[string]*pb.Value{"v": ival(int64(i))})
+	}
+	for _, d := range []index.Def{doomed, keeper} {
+		if _, err := s.BackfillIndex(ctx, d); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// A batch size below the document count so the loop actually iterates —
+	// a single-batch run would not exercise the batching this relies on.
+	n, err := s.DropCollection(ctx, "doomed", 10, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 25 {
+		t.Errorf("deleted %d, want 25", n)
+	}
+
+	if got, _ := s.CountCollection(ctx, "doomed"); got != 0 {
+		t.Errorf("%d documents survived the drop", got)
+	}
+	if got, _ := s.CountCollection(ctx, "keeper"); got != 7 {
+		t.Errorf("keeper has %d documents, want 7 — the drop was not contained", got)
+	}
+	// Index entries whose documents are gone are unreachable rows that still
+	// cost work on every write, and a query finding one would fail.
+	if got, _ := s.CountIndexEntries(ctx, doomed); got != 0 {
+		t.Errorf("%d index entries outlived their documents", got)
+	}
+	if got, _ := s.CountIndexEntries(ctx, keeper); got != 7 {
+		t.Errorf("keeper index has %d entries, want 7", got)
+	}
+
+	var registry int
+	if err := s.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM collections WHERE collection_id = 'doomed'`).Scan(&registry); err != nil {
+		t.Fatal(err)
+	}
+	if registry != 0 {
+		t.Errorf("registry still lists the dropped collection (%d rows)", registry)
+	}
+	if err := s.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM collections WHERE collection_id = 'keeper'`).Scan(&registry); err != nil {
+		t.Fatal(err)
+	}
+	if registry != 1 {
+		t.Errorf("keeper registry row = %d, want 1", registry)
 	}
 }

@@ -373,3 +373,93 @@ func (s *Store) IndexedMergedQueries() int64 { return s.indexedMerged.Load() }
 // IndexedContainsQueries counts index-served queries served by an
 // array-contains definition.
 func (s *Store) IndexedContainsQueries() int64 { return s.indexedContains.Load() }
+
+// DropCollection removes every document in a collection, along with its index
+// entries and its registry row.
+//
+// This exists because an import can go wrong — interrupted, or pointed at the
+// wrong collection — and the only alternative is hand-written DELETE statements
+// against a live database, which is how the wrong rows get removed.
+//
+// The work is batched and each batch is its own transaction. A single
+// 43k-row DELETE is one long transaction holding locks the whole time and one
+// large burst of WAL, which is precisely what filled the disk during the import
+// this was written to undo. Batching lets WAL archive and recycle as it goes.
+//
+// Entries are removed before documents, in the same transaction: an index entry
+// whose document is gone is unreachable, and a query that found it would fail
+// rather than skip it.
+func (s *Store) DropCollection(ctx context.Context, collectionID string, batch int, progress func(done int64)) (int64, error) {
+	if collectionID == "" {
+		return 0, fmt.Errorf("store: drop collection: empty collection id")
+	}
+	if batch <= 0 {
+		batch = 2000
+	}
+	var total int64
+	for {
+		names, err := s.collectionBatch(ctx, collectionID, batch)
+		if err != nil {
+			return total, err
+		}
+		if len(names) == 0 {
+			break
+		}
+		tx, err := s.Pool.Begin(ctx)
+		if err != nil {
+			return total, err
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM index_entries WHERE doc_name = ANY($1)`, names); err != nil {
+			_ = tx.Rollback(ctx)
+			return total, fmt.Errorf("store: drop index entries: %w", err)
+		}
+		tag, err := tx.Exec(ctx, `DELETE FROM documents WHERE name = ANY($1)`, names)
+		if err != nil {
+			_ = tx.Rollback(ctx)
+			return total, fmt.Errorf("store: drop documents: %w", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return total, err
+		}
+		total += tag.RowsAffected()
+		if progress != nil {
+			progress(total)
+		}
+	}
+	// Only now is the registry row safe to remove: a parent keeps its entry for
+	// as long as any document remains under it.
+	if _, err := s.Pool.Exec(ctx, `
+		DELETE FROM collections c WHERE c.collection_id = $1
+		  AND NOT EXISTS (SELECT 1 FROM documents d
+		                  WHERE d.collection_id = c.collection_id AND d.parent_path = c.parent_path)`,
+		collectionID); err != nil {
+		return total, fmt.Errorf("store: drop collection registry: %w", err)
+	}
+	return total, nil
+}
+
+func (s *Store) collectionBatch(ctx context.Context, collectionID string, batch int) ([]string, error) {
+	rows, err := s.Pool.Query(ctx,
+		`SELECT name FROM documents WHERE collection_id = $1 ORDER BY name LIMIT $2`, collectionID, batch)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			return nil, err
+		}
+		names = append(names, n)
+	}
+	return names, rows.Err()
+}
+
+// CountCollection reports how many documents a collection holds.
+func (s *Store) CountCollection(ctx context.Context, collectionID string) (int64, error) {
+	var n int64
+	err := s.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM documents WHERE collection_id = $1`, collectionID).Scan(&n)
+	return n, err
+}

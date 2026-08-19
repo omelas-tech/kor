@@ -41,6 +41,8 @@ func main() {
 		runVerify(os.Args[2:])
 	case "stats":
 		runStats(os.Args[2:])
+	case "drop":
+		runDrop(os.Args[2:])
 	case "index":
 		runIndex(os.Args[2:])
 	case "bench":
@@ -51,7 +53,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: kor <import|export|verify|stats|bench|index> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: kor <import|export|verify|stats|bench|index|drop> [flags]")
 	os.Exit(2)
 }
 

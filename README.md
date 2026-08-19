@@ -83,9 +83,10 @@ production application's full API test suite passing against Kor unchanged):
 - **Composite indexes** (`index_entries`), maintained transactionally with the
   document write and serving equality prefixes, inequality ranges, ordering and
   cursors straight from key order — so `LIMIT`/`OFFSET` push into Postgres and
-  a paged query costs O(limit) rather than O(matching documents). Definitions
-  come from your existing `firestore.indexes.json`; see
-  [docs/indexes.md](docs/indexes.md)
+  a paged query costs O(limit) rather than O(matching documents). Also
+  `in`/`array-contains`/`array-contains-any`, planned as several ranges and
+  merged back into query order. Definitions come from your existing
+  `firestore.indexes.json`; see [docs/indexes.md](docs/indexes.md)
 - **Differential fuzzing against Google's own Firestore emulator**: the same
   corpus in both stores, thousands of generated queries per run, results and
   order diffed, on both the general and the index path. It runs in CI with a
@@ -107,10 +108,11 @@ Firestore semantics are re-evaluated in Go. The general path is the reference
 implementation: the planner declines any shape it cannot serve exactly, and
 the index path is diffed against both it and the Google emulator.
 
-Honest gaps in the index path: `array-contains` and vector indexes are not
-served (they are different data structures, not orderings, and are skipped
-loudly when parsing your config), and the planner still declines disjunctions
-and a second inequality field.
+Honest gaps in the index path: vector indexes are not served (an
+approximate-nearest-neighbour structure is not an ordering, so it is skipped
+loudly when parsing your config), and the planner declines `OR` composites
+across different fields and a second inequality field. Both fall back to the
+general path, which answers them correctly.
 
 On the roadmap (in build order):
 

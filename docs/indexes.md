@@ -46,16 +46,11 @@ against a store serving four collections costs work on every write with no
 query able to read it. `-collection a,b` and `-all` override the default, and
 `-dry-run` prints the selection without writing.
 
-Two kinds are skipped, with the reason printed:
-
-| Kind | Why |
-|---|---|
-| `arrayConfig` (array-contains) | an inverted index over element values, not an ordering |
-| `vectorConfig` | an approximate-nearest-neighbour structure, not an ordering |
-
-Neither can be expressed as a sort-key range. Approximating one would produce an
-index the planner accepts and then serves wrong results from, which is worse
-than not having it.
+`arrayConfig: CONTAINS` fields are supported (see below). Vector indexes are
+skipped, with the reason printed: an approximate-nearest-neighbour structure is
+not an ordering and cannot be expressed as a sort-key range. Approximating one
+would produce an index the planner accepts and then serves wrong results from,
+which is worse than not having it.
 
 ---
 
@@ -95,9 +90,41 @@ entirely or entirely inverted (an ascending index serves a descending query by
 scanning backwards). Cursors and one inequality on the first ordering field
 become bounds on the same byte range.
 
+**`in` becomes several ranges.** Each value is planned by the ordinary equality
+path with that value substituted, so the bound arithmetic, type clamping and
+cursor handling stay in one place instead of being reimplemented. The ranges sit
+in different parts of the index, so Postgres cannot order across them; the merge
+happens in Kor, comparing each key's ORDERING SUFFIX rather than the whole key.
+The prefixes are exactly what differ between ranges — and differ in length,
+the encoding being variable-width — so comparing whole keys would group results
+by the in-list value instead of interleaving them. Each range is read only
+offset+limit deep, since nothing past that position can reach the page.
+
+**`array-contains` is a prefix lookup.** A definition may mark one field as an
+array-contains component; a document then produces one entry per DISTINCT
+element instead of one entry per document, and `array-contains x` is an ordinary
+equality on that position. Distinct matters: an array may hold a value twice,
+and two identical entries for one document would collide on the primary key.
+An empty array, a non-array value and a missing field all index nothing, exactly
+as Firestore excludes them.
+
+Contains and equality components are **not** interchangeable — an
+array-contains index must not serve an `==` query, nor an equality index an
+array-contains query. They are different shapes, and confusing them returns
+documents whose field merely equals the whole array, or misses every document
+whose array contains the value.
+
+**`array-contains-any` is multi-range with dedup.** Its ranges overlap: a
+document holding two of the queried values matches once per element, and
+Firestore returns it once. Because duplicates collapse during the merge, these
+plans cannot use the offset+limit prefetch — a bounded read would silently
+return a short page — so each range is read in full. No document is fetched
+beyond the page, which is where the cost is.
+
 It declines — falling back to the general path, which is the reference
-implementation — disjunctions, a second inequality field, an inequality off the
-first ordering field, `__name__` filters, and equality outside the prefix.
+implementation — `OR` composites across different fields, a second inequality
+field, an inequality off the first ordering field, `__name__` filters, and
+equality outside the prefix.
 
 A declined query is a lost optimisation. A wrongly-served one is a silent bug,
 so the planner refuses anything it cannot serve exactly.

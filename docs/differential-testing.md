@@ -28,6 +28,15 @@ int64 past 2^53, negative zero, strings including non-ASCII, bytes, references,
 geopoints, arrays, maps, nested maps — and omits fields from some documents,
 because "the field is missing" is its own case in every ordering rule.
 
+Coverage is asserted, not assumed. The index run requires a non-zero count of
+queries served by an index, by the multi-range merge, and by an array-contains
+definition — because "an index was used" does not imply "the merge ran" or
+"element fan-out ran", and a run that quietly exercised none of them would
+otherwise pass. Two coverage regressions were caught exactly this way: an `in`
+shape ordered by `__name__` that never reached the planner, and a `default:`
+branch made unreachable by adding a case above it, which silently stopped
+generating two whole shapes.
+
 Queries vary by **shape**, not only by value: inequalities with their required
 ordering, ordering with no filter, two-field ordering where ties in the first
 are broken by the second, equality plus an unrelated ordering, `__name__`
@@ -70,6 +79,14 @@ by reasoning:
    numbers that sort before them. The general path enforced that; the index
    path produced a byte range spanning type boundaries.
 
+5. **`array-contains-any [x, null]` matched documents holding null.** Firestore
+   ignores null and NaN in the list and matches on the rest, while
+   `[null]` alone matches nothing — the same asymmetry `in` has. Note which
+   side was wrong: the INDEX path was already correct here, because its planner
+   drops those values, while the general path — the reference implementation —
+   was not. A test comparing the two against each other would have shown them
+   disagreeing with no way to tell which was right.
+
 It also found Kor being quietly *more permissive* than Firestore, accepting a
 duplicated `orderBy` field that Firestore rejects. That direction of divergence
 is the one that hurts in a migration: code that works against Kor then fails
@@ -95,7 +112,7 @@ fuzz: 1200 queries, 120 docs, indexes=true — mismatches=0 korRefused=0 emuRefu
 ## What it does not cover
 
 Only `RunQuery`. Transactions, listeners and aggregations are tested
-conventionally. Cross-collection-group queries, `OR` composites and
-`array-contains` indexes are not yet in the generator — each is a place a bug
+conventionally. Cross-collection-group queries and `OR` composites are not yet
+in the generator — each is a place a bug
 could still be hiding, and the honest reading of a green run is "no divergence
 in the shapes generated", not "no divergence".

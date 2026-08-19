@@ -443,3 +443,86 @@ func TestIndexedInequalityStaysInsideTheOperandType(t *testing.T) {
 		}
 	}
 }
+
+// An `in` filter is served as one scan range per value, merged back into query
+// order. The merge is the risky part: the ranges differ precisely in their
+// equality prefix, so comparing whole keys would group results by the in-list
+// value instead of interleaving them — which is wrong, and looks plausible
+// because each group is internally well ordered.
+func TestIndexedInFilterMatchesGeneralPath(t *testing.T) {
+	s := openStore(t)
+	ctx := context.Background()
+
+	d := index.Def{CollectionID: "posts", Fields: []index.Field{{Path: "author"}, {Path: "score"}}}
+	dDesc := index.Def{CollectionID: "posts", Fields: []index.Field{{Path: "author"}, {Path: "score", Desc: true}}}
+	defs := []index.Def{d, dDesc}
+	if err := s.SetIndexes(ctx, defs); err != nil {
+		t.Fatal(err)
+	}
+	seedPosts(t, s, 90)
+	for _, def := range defs {
+		if _, err := s.BackfillIndex(ctx, def); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	inFilter := func(path string, vals ...*pb.Value) *pb.StructuredQuery_Filter {
+		return &pb.StructuredQuery_Filter{FilterType: &pb.StructuredQuery_Filter_FieldFilter{
+			FieldFilter: &pb.StructuredQuery_FieldFilter{
+				Field: &pb.StructuredQuery_FieldReference{FieldPath: path},
+				Op:    pb.StructuredQuery_FieldFilter_IN,
+				Value: &pb.Value{ValueType: &pb.Value_ArrayValue{
+					ArrayValue: &pb.ArrayValue{Values: vals}}},
+			}}}
+	}
+
+	cases := []struct {
+		name string
+		sq   *pb.StructuredQuery
+	}{
+		{"two values ascending", &pb.StructuredQuery{
+			From: from("posts"), Where: inFilter("author", sval("ann"), sval("bob")),
+			OrderBy: []*pb.StructuredQuery_Order{orderBy("score", pb.StructuredQuery_ASCENDING)},
+		}},
+		{"two values descending", &pb.StructuredQuery{
+			From: from("posts"), Where: inFilter("author", sval("ann"), sval("bob")),
+			OrderBy: []*pb.StructuredQuery_Order{orderBy("score", pb.StructuredQuery_DESCENDING)},
+		}},
+		{"three values", &pb.StructuredQuery{
+			From: from("posts"), Where: inFilter("author", sval("ann"), sval("bob"), sval("cat")),
+			OrderBy: []*pb.StructuredQuery_Order{orderBy("score", pb.StructuredQuery_ASCENDING)},
+		}},
+		// The page must be drawn after merging, not per range.
+		{"with limit", &pb.StructuredQuery{
+			From: from("posts"), Where: inFilter("author", sval("ann"), sval("bob"), sval("cat")),
+			OrderBy: []*pb.StructuredQuery_Order{orderBy("score", pb.StructuredQuery_ASCENDING)},
+			Limit:   wrapperspb.Int32(7),
+		}},
+		{"with limit and offset", &pb.StructuredQuery{
+			From: from("posts"), Where: inFilter("author", sval("ann"), sval("bob"), sval("cat")),
+			OrderBy: []*pb.StructuredQuery_Order{orderBy("score", pb.StructuredQuery_DESCENDING)},
+			Limit:   wrapperspb.Int32(5), Offset: 4,
+		}},
+		// A repeated value must not return its documents twice.
+		{"duplicate values", &pb.StructuredQuery{
+			From: from("posts"), Where: inFilter("author", sval("ann"), sval("ann")),
+			OrderBy: []*pb.StructuredQuery_Order{orderBy("score", pb.StructuredQuery_ASCENDING)},
+		}},
+		{"one matching value only", &pb.StructuredQuery{
+			From: from("posts"), Where: inFilter("author", sval("ann"), sval("nobody")),
+			OrderBy: []*pb.StructuredQuery_Order{orderBy("score", pb.StructuredQuery_ASCENDING)},
+		}},
+		{"no matching values", &pb.StructuredQuery{
+			From: from("posts"), Where: inFilter("author", sval("nobody"), sval("neither")),
+			OrderBy: []*pb.StructuredQuery_Order{orderBy("score", pb.StructuredQuery_ASCENDING)},
+		}},
+		{"cursor across ranges", &pb.StructuredQuery{
+			From: from("posts"), Where: inFilter("author", sval("ann"), sval("bob")),
+			OrderBy: []*pb.StructuredQuery_Order{orderBy("score", pb.StructuredQuery_ASCENDING)},
+			StartAt: &pb.Cursor{Values: []*pb.Value{ival(8)}, Before: true},
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) { bothWays(t, s, defs, mkQuery(t, tc.sq)) })
+	}
+}

@@ -31,6 +31,10 @@ type Store struct {
 	// indexedQueries counts queries served from index_entries. See
 	// IndexedQueries: registered and actually-used are different claims.
 	indexedQueries atomic.Int64
+	// indexedMerged counts index-served queries that had to merge several
+	// ranges (an `in` filter). Separate because "an index was used" and "the
+	// merge path was exercised" are different claims.
+	indexedMerged atomic.Int64
 }
 
 // Doc is a stored document.

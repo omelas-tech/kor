@@ -266,7 +266,7 @@ func runFuzz(t *testing.T, withIndexes bool) {
 	ops := []string{"==", ">", ">=", "<", "<="}
 	specs := generateSpecs(rnd, fields, vals, ops, 1200)
 
-	before := st.IndexedQueries()
+	before, beforeMerged := st.IndexedQueries(), st.IndexedMergedQueries()
 	var mismatches, korOnlyErr, emuOnlyErr int
 	for i, sp := range specs {
 		korIDs, korErr := runIDs(ctx, sp.build(*kor.Collection(coll)))
@@ -297,14 +297,18 @@ func runFuzz(t *testing.T, withIndexes bool) {
 		}
 	}
 	served := st.IndexedQueries() - before
+	merged := st.IndexedMergedQueries() - beforeMerged
+	t.Logf("index-served queries: %d (of which merged: %d)", served, merged)
 	if withIndexes && served == 0 {
-		t.Fatal("no query was served from an index, so this run duplicates the general-path run " +
+		t.Error("no query was served from an index, so this run duplicates the general-path run " +
 			"and proves nothing about the index path")
 	}
-	if !withIndexes && served != 0 {
-		t.Fatalf("%d queries hit an index with none registered", served)
+	if withIndexes && merged == 0 {
+		t.Error("no query exercised the multi-range merge, so `in` support is untested here")
 	}
-	t.Logf("index-served queries: %d", served)
+	if !withIndexes && served != 0 {
+		t.Errorf("%d queries hit an index with none registered", served)
+	}
 	t.Logf("fuzz: %d queries, %d docs, indexes=%v — mismatches=%d korRefused=%d emuRefused=%d",
 		len(specs), nDocs, withIndexes, mismatches, korOnlyErr, emuOnlyErr)
 	if mismatches > 8 || korOnlyErr > 5 {
@@ -328,7 +332,7 @@ func generateSpecs(rnd *rand.Rand, fields []string, vals []any, ops []string, n 
 	}
 
 	for i := 0; i < n; i++ {
-		shape := rnd.Intn(8)
+		shape := rnd.Intn(9)
 		d1, d2 := dir(), dir()
 		f1, f2 := pick(fields), pick(fields)
 		op, v := pick(ops), val()
@@ -418,6 +422,10 @@ func generateSpecs(rnd *rand.Rand, fields []string, vals []any, ops []string, n 
 			build = func(c firestore.CollectionRef) firestore.Query {
 				return tail(c.Where(f1, "!=", v).OrderBy(f1, d1))
 			}
+		// NOTE: keep this the highest case index, and keep rnd.Intn above in
+		// step with it. A `default` that no value can reach compiles, passes,
+		// and silently stops generating a whole shape — which is how
+		// array-contains and `in` went untested for a while here.
 		default: // array-contains and in, which take different evaluation paths
 			if rnd.Intn(2) == 0 {
 				desc = fmt.Sprintf("where %s array-contains %v | orderBy __name__", f1, v)
@@ -426,9 +434,13 @@ func generateSpecs(rnd *rand.Rand, fields []string, vals []any, ops []string, n 
 				}
 			} else {
 				a, b := val(), val()
-				desc = fmt.Sprintf("where %s in [%v %v] | orderBy __name__", f1, a, b)
+				// Ordered by a FIELD, not __name__: an in-filter becomes one
+				// scan range per value, and only a field ordering forces those
+				// ranges to be interleaved rather than concatenated. Ordering
+				// by __name__ alone would hide every merge bug.
+				desc = fmt.Sprintf("where %s in [%v %v] | orderBy %s", f1, a, b, f2)
 				build = func(c firestore.CollectionRef) firestore.Query {
-					return tail(c.Where(f1, "in", []any{a, b}).OrderBy(firestore.DocumentID, d1))
+					return tail(c.Where(f1, "in", []any{a, b}).OrderBy(f2, d2))
 				}
 			}
 		}

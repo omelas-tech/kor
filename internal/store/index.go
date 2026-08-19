@@ -366,3 +366,7 @@ func (s *Store) CollectionsWithDocuments(ctx context.Context) (map[string]bool, 
 // a dashboard that cannot tell them apart will report success while every query
 // quietly falls back.
 func (s *Store) IndexedQueries() int64 { return s.indexedQueries.Load() }
+
+// IndexedMergedQueries counts index-served queries whose plan spanned more than
+// one range, i.e. those that went through the k-way merge.
+func (s *Store) IndexedMergedQueries() int64 { return s.indexedMerged.Load() }

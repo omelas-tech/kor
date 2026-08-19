@@ -84,7 +84,7 @@ func TestPlannerSelectsAMatchingIndex(t *testing.T) {
 	if plan.Reversed {
 		t.Error("ascending query against an ascending index should not reverse the scan")
 	}
-	if len(plan.Lo) == 0 {
+	if len(plan.Ranges[0].Lo) == 0 {
 		t.Error("prefix must bound the scan to the equality group")
 	}
 }
@@ -167,11 +167,11 @@ func TestCursorNarrowsTheScanRange(t *testing.T) {
 	if !ok {
 		t.Fatal("a cursor on the ordering field is a key bound, so it should plan")
 	}
-	if bytes.Compare(c.Lo, b.Lo) <= 0 {
-		t.Errorf("a start cursor must raise the lower bound: base=%x cursor=%x", b.Lo, c.Lo)
+	if bytes.Compare(c.Ranges[0].Lo, b.Ranges[0].Lo) <= 0 {
+		t.Errorf("a start cursor must raise the lower bound: base=%x cursor=%x", b.Ranges[0].Lo, c.Ranges[0].Lo)
 	}
-	if !bytes.Equal(c.Hi, b.Hi) {
-		t.Errorf("a start cursor must not move the upper bound: base=%x cursor=%x", b.Hi, c.Hi)
+	if !bytes.Equal(c.Ranges[0].Hi, b.Ranges[0].Hi) {
+		t.Errorf("a start cursor must not move the upper bound: base=%x cursor=%x", b.Ranges[0].Hi, c.Ranges[0].Hi)
 	}
 }
 
@@ -198,11 +198,11 @@ func TestStartCursorBoundsTheHighEndWhenReversed(t *testing.T) {
 	if !p.Reversed {
 		t.Fatal("an ascending index serving a descending query must scan reversed")
 	}
-	if bytes.Compare(p.Hi, b.Hi) >= 0 {
-		t.Errorf("a start cursor on a reversed scan must lower the upper bound: base=%x got=%x", b.Hi, p.Hi)
+	if bytes.Compare(p.Ranges[0].Hi, b.Ranges[0].Hi) >= 0 {
+		t.Errorf("a start cursor on a reversed scan must lower the upper bound: base=%x got=%x", b.Ranges[0].Hi, p.Ranges[0].Hi)
 	}
-	if !bytes.Equal(p.Lo, b.Lo) {
-		t.Errorf("it must not move the lower bound: base=%x got=%x", b.Lo, p.Lo)
+	if !bytes.Equal(p.Ranges[0].Lo, b.Ranges[0].Lo) {
+		t.Errorf("it must not move the lower bound: base=%x got=%x", b.Ranges[0].Lo, p.Ranges[0].Lo)
 	}
 }
 
@@ -231,9 +231,9 @@ func TestInequalityBoundsFollowFieldDirectionNotScanDirection(t *testing.T) {
 	}
 	// Same index field (ascending), so "score > 3" is the same byte range in
 	// both; only the walk direction differs.
-	if !bytes.Equal(asc.Lo, desc.Lo) || !bytes.Equal(asc.Hi, desc.Hi) {
+	if !bytes.Equal(asc.Ranges[0].Lo, desc.Ranges[0].Lo) || !bytes.Equal(asc.Ranges[0].Hi, desc.Ranges[0].Hi) {
 		t.Errorf("scan direction must not change which bytes qualify:\n asc  [%x,%x)\n desc [%x,%x)",
-			asc.Lo, asc.Hi, desc.Lo, desc.Hi)
+			asc.Ranges[0].Lo, asc.Ranges[0].Hi, desc.Ranges[0].Lo, desc.Ranges[0].Hi)
 	}
 	if !desc.Reversed {
 		t.Error("the descending query should still scan reversed")

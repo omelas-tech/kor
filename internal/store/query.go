@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"math"
@@ -43,18 +44,23 @@ func (s *Store) RunQuery(ctx context.Context, q *query.Query, yield func(*Doc) e
 		}
 	}
 
-	dir, nameOnly := q.NameOnlyOrder()
-	if nameOnly {
-		return s.runNameOrdered(ctx, q, where, args, dir, yield)
-	}
 	// A composite index serves this only if one exists, is backfilled, and
-	// covers the shape exactly. Anything else falls back to runGeneral, which
-	// remains the reference implementation — every shape the planner declines
-	// is a performance opportunity, never a correctness risk.
+	// covers the shape exactly. Anything else falls back below to runGeneral,
+	// which remains the reference implementation — every shape the planner
+	// declines is a performance opportunity, never a correctness risk.
+	//
+	// This is checked BEFORE the __name__-ordered fast path. That path scans
+	// the documents table in name order and filters in Go, which is O(the
+	// collection) for any filter it cannot turn into a jsonb containment probe
+	// — `in` among them. An index that covers the shape is O(limit) instead, so
+	// where both apply the index is strictly better.
 	if defs := s.indexes.forCollection(q.CollectionID); len(defs) > 0 {
 		if plan, ok := index.For(q, defs, s.indexes.readySet()); ok {
 			return s.runIndexed(ctx, q, plan, yield)
 		}
+	}
+	if dir, nameOnly := q.NameOnlyOrder(); nameOnly {
+		return s.runNameOrdered(ctx, q, where, args, dir, yield)
 	}
 	return s.runGeneral(ctx, q, where, args, yield)
 }
@@ -359,44 +365,12 @@ func scanDoc(rows interface {
 // whole design exists to avoid.
 func (s *Store) runIndexed(ctx context.Context, q *query.Query, plan *index.Plan, yield func(*Doc) error) error {
 	s.indexedQueries.Add(1)
-	lo, hi := plan.Lo, plan.Hi
-
-	order := "ASC"
-	if plan.Reversed {
-		order = "DESC"
+	if len(plan.Ranges) > 1 {
+		s.indexedMerged.Add(1)
 	}
 
-	args := []any{plan.Def.ID(), lo}
-	sql := `SELECT e.doc_name FROM index_entries e WHERE e.index_id = $1 AND e.key >= $2`
-	if hi != nil {
-		args = append(args, hi)
-		sql += fmt.Sprintf(" AND e.key < $%d", len(args))
-	}
-	sql += " ORDER BY e.key " + order
-	if q.Limit >= 0 {
-		args = append(args, int64(q.Limit))
-		sql += fmt.Sprintf(" LIMIT $%d", len(args))
-	}
-	if q.Offset > 0 {
-		args = append(args, int64(q.Offset))
-		sql += fmt.Sprintf(" OFFSET $%d", len(args))
-	}
-
-	rows, err := s.Pool.Query(ctx, sql, args...)
+	names, err := s.scanIndex(ctx, q, plan)
 	if err != nil {
-		return fmt.Errorf("store: index scan: %w", err)
-	}
-	var names []string
-	for rows.Next() {
-		var n string
-		if err := rows.Scan(&n); err != nil {
-			rows.Close()
-			return err
-		}
-		names = append(names, n)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
 		return err
 	}
 	if len(names) == 0 {
@@ -428,4 +402,142 @@ func (s *Store) runIndexed(ctx context.Context, q *query.Query, plan *index.Plan
 		}
 	}
 	return nil
+}
+
+// scanIndex returns the document names for a plan, already in query order and
+// already paged.
+//
+// One range is the common case and pushes ordering, LIMIT and OFFSET entirely
+// into Postgres. Several ranges — an `in` filter — cannot: each range sits in a
+// different part of the index, so their union is not contiguous and Postgres
+// cannot order across them by key. The merge happens here instead.
+func (s *Store) scanIndex(ctx context.Context, q *query.Query, plan *index.Plan) ([]string, error) {
+	switch len(plan.Ranges) {
+	case 0:
+		return nil, nil
+	case 1:
+		r := plan.Ranges[0]
+		rows, err := s.scanRange(ctx, plan, r, q.Limit, q.Offset)
+		if err != nil {
+			return nil, err
+		}
+		names := make([]string, len(rows))
+		for i, e := range rows {
+			names[i] = e.name
+		}
+		return names, nil
+	}
+
+	// Multi-range. Each range is fetched only as deep as the page could
+	// possibly reach — offset+limit rows — because a document beyond that
+	// position in its own range cannot appear within the page after merging.
+	// Total rows read is k*(offset+limit) rather than every matching document.
+	perRange := int32(-1)
+	if q.Limit >= 0 {
+		perRange = q.Limit + q.Offset
+	}
+	streams := make([][]indexRow, 0, len(plan.Ranges))
+	for _, r := range plan.Ranges {
+		rows, err := s.scanRange(ctx, plan, r, perRange, 0)
+		if err != nil {
+			return nil, err
+		}
+		if len(rows) > 0 {
+			streams = append(streams, rows)
+		}
+	}
+	return mergeRanges(streams, plan.Reversed, q.Limit, q.Offset), nil
+}
+
+// indexRow is one index entry: the document it points at, and the part of its
+// key that carries the ordering.
+type indexRow struct {
+	name   string
+	suffix []byte
+}
+
+func (s *Store) scanRange(ctx context.Context, plan *index.Plan, r index.Range, limit, offset int32) ([]indexRow, error) {
+	order := "ASC"
+	if plan.Reversed {
+		order = "DESC"
+	}
+	// substring() extracts the ordering suffix in Postgres so the merge does
+	// not have to re-derive it, and so the equality prefix — which differs in
+	// both value and LENGTH between ranges — never takes part in comparisons.
+	args := []any{plan.Def.ID(), r.Lo, r.SuffixFrom + 1}
+	sql := `SELECT e.doc_name, substring(e.key from $3) FROM index_entries e
+	        WHERE e.index_id = $1 AND e.key >= $2`
+	if r.Hi != nil {
+		args = append(args, r.Hi)
+		sql += fmt.Sprintf(" AND e.key < $%d", len(args))
+	}
+	sql += " ORDER BY e.key " + order
+	if limit >= 0 {
+		args = append(args, int64(limit))
+		sql += fmt.Sprintf(" LIMIT $%d", len(args))
+	}
+	if offset > 0 {
+		args = append(args, int64(offset))
+		sql += fmt.Sprintf(" OFFSET $%d", len(args))
+	}
+
+	rows, err := s.Pool.Query(ctx, sql, args...)
+	if err != nil {
+		return nil, fmt.Errorf("store: index scan: %w", err)
+	}
+	defer rows.Close()
+	var out []indexRow
+	for rows.Next() {
+		var e indexRow
+		if err := rows.Scan(&e.name, &e.suffix); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// mergeRanges interleaves already-sorted streams into one query-ordered list.
+//
+// Comparison is on the ordering suffix, never the whole key: the ranges differ
+// precisely in their equality prefix, so comparing whole keys would order by
+// the in-list value rather than by what the query asked to order by — grouping
+// results by value instead of interleaving them, which is wrong and looks
+// plausible.
+func mergeRanges(streams [][]indexRow, reversed bool, limit, offset int32) []string {
+	pos := make([]int, len(streams))
+	var out []string
+	skipped := int32(0)
+	for {
+		best := -1
+		for i, st := range streams {
+			if pos[i] >= len(st) {
+				continue
+			}
+			if best == -1 {
+				best = i
+				continue
+			}
+			c := bytes.Compare(st[pos[i]].suffix, streams[best][pos[best]].suffix)
+			if reversed {
+				c = -c
+			}
+			if c < 0 {
+				best = i
+			}
+		}
+		if best == -1 {
+			return out
+		}
+		row := streams[best][pos[best]]
+		pos[best]++
+		if skipped < offset {
+			skipped++
+			continue
+		}
+		out = append(out, row.name)
+		if limit >= 0 && int32(len(out)) >= limit {
+			return out
+		}
+	}
 }

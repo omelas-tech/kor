@@ -28,9 +28,30 @@ import (
 // "everything strictly after this group" is PrefixEnd of it. A nil Hi means
 // unbounded above.
 type Plan struct {
-	Def      Def
-	Lo, Hi   []byte
+	Def Def
+	// Ranges is normally one. An `in` filter on a prefix field produces one
+	// range per value: each is a separate contiguous group in the index, and
+	// together they are the query's result set. They are disjoint, so no
+	// document can appear twice.
+	Ranges   []Range
 	Reversed bool // scan descending
+}
+
+// Range is one contiguous scan [Lo, Hi). SuffixFrom is where this range's
+// equality prefix ends, which is what makes multiple ranges comparable: their
+// prefixes differ (and differ in LENGTH, since the encoding is variable-width),
+// so ordering across them means comparing key[SuffixFrom:], never whole keys.
+type Range struct {
+	Lo, Hi     []byte
+	SuffixFrom int
+}
+
+// Single reports the only range, for the common case.
+func (p *Plan) Single() (Range, bool) {
+	if len(p.Ranges) == 1 {
+		return p.Ranges[0], true
+	}
+	return Range{}, false
 }
 
 // Eligible reports whether a query is a shape this package can serve at all,
@@ -41,7 +62,7 @@ func Eligible(q *query.Query) bool {
 	// ordering field — which is the only place Firestore allows one, and the
 	// only position a byte range can express. Disjunctions need a union of
 	// scans and are still declined.
-	if _, _, ok := splitFilters(q); !ok {
+	if _, _, _, ok := splitFilters(q); !ok {
 		return false
 	}
 	return true
@@ -57,7 +78,7 @@ func For(q *query.Query, defs []Def, ready map[int64]bool) (*Plan, bool) {
 	if !Eligible(q) {
 		return nil, false
 	}
-	eq, _, _ := splitFilters(q)
+	eq, _, in, _ := splitFilters(q)
 
 	for _, d := range defs {
 		if d.CollectionID != q.CollectionID || d.Group != q.AllDescendants {
@@ -66,15 +87,11 @@ func For(q *query.Query, defs []Def, ready map[int64]bool) (*Plan, bool) {
 		if !ready[d.ID()] {
 			continue
 		}
-		prefix, reversed, ok := match(d, eq, q.Order)
+		ranges, reversed, ok := planRanges(d, eq, in, q)
 		if !ok {
 			continue
 		}
-		lo, hi, ok := bounds(d, len(eq), prefix, reversed, q)
-		if !ok {
-			continue
-		}
-		return &Plan{Def: d, Lo: lo, Hi: hi, Reversed: reversed}, true
+		return &Plan{Def: d, Ranges: ranges, Reversed: reversed}, true
 	}
 	return nil, false
 }
@@ -194,7 +211,7 @@ func bounds(d Def, eqCount int, prefix []byte, reversed bool, q *query.Query) (l
 	}
 	fieldDesc := fields[eqCount].Desc
 
-	if _, ineq, valid := splitFilters(q); valid && ineq != nil {
+	if _, ineq, _, valid := splitFilters(q); valid && ineq != nil {
 		// A range comparison applies only within the operand's type. Without
 		// this clamp the scan spans type boundaries and returns, say, strings
 		// for `score > 4` — which runIndexed's re-check catches as an error
@@ -328,22 +345,103 @@ func minBound(a, b []byte) []byte {
 // null/NaN filters, __name__ filters, a second inequality field — because each
 // needs bounds this planner does not build, and guessing produces a scan that
 // quietly omits results.
-func splitFilters(q *query.Query) (eq map[string]*pb.Value, ineq *inequality, ok bool) {
+func splitFilters(q *query.Query) (eq map[string]*pb.Value, ineq *inequality, in *inList, ok bool) {
 	eq = map[string]*pb.Value{}
-	if !collect(q.Where, eq, &ineq) {
-		return nil, nil, false
+	if !collect(q.Where, eq, &ineq, &in) {
+		return nil, nil, nil, false
 	}
 	if ineq != nil {
 		// The inequality field must be the first ordering term, or the range it
 		// describes is not contiguous in this index.
 		if len(q.Order) == 0 || q.Order[0].IsName || q.Order[0].Path.String() != ineq.path {
-			return nil, nil, false
+			return nil, nil, nil, false
 		}
 	}
-	return eq, ineq, true
+	if in != nil {
+		// The in-field joins the equality prefix, so it must not also be
+		// filtered by equality or carry the inequality.
+		if _, dup := eq[in.path]; dup {
+			return nil, nil, nil, false
+		}
+		if ineq != nil && ineq.path == in.path {
+			return nil, nil, nil, false
+		}
+		if len(in.values) == 0 {
+			return nil, nil, nil, false
+		}
+	}
+	return eq, ineq, in, true
 }
 
-func collect(f *pb.StructuredQuery_Filter, eq map[string]*pb.Value, ineq **inequality) bool {
+// inList is a single `in` filter, which the planner turns into one scan range
+// per value.
+type inList struct {
+	path   string
+	values []*pb.Value
+}
+
+// planRanges builds the scan ranges for one definition.
+//
+// An `in` filter is exactly N equality filters unioned, so each value is
+// planned by the ordinary equality path with that value substituted. That reuse
+// is the point: the bound arithmetic, the type clamping and the cursor
+// handling are the parts most likely to be got wrong, and they stay in one
+// place rather than being reimplemented for the multi-range case.
+func planRanges(d Def, eq map[string]*pb.Value, in *inList, q *query.Query) ([]Range, bool, bool) {
+	if in == nil {
+		prefix, reversed, ok := match(d, eq, q.Order)
+		if !ok {
+			return nil, false, false
+		}
+		lo, hi, ok := bounds(d, len(eq), prefix, reversed, q)
+		if !ok {
+			return nil, false, false
+		}
+		return []Range{{Lo: lo, Hi: hi, SuffixFrom: len(prefix)}}, reversed, true
+	}
+
+	sub := make(map[string]*pb.Value, len(eq)+1)
+	for k, v := range eq {
+		sub[k] = v
+	}
+	var ranges []Range
+	var reversed bool
+	seen := map[string]bool{}
+	for _, v := range in.values {
+		// Firestore matches neither null nor NaN through `in`, so a range for
+		// either would return documents the general path excludes.
+		if value.IsNull(v) || value.IsNaN(v) {
+			continue
+		}
+		sub[in.path] = v
+		prefix, rev, ok := match(d, sub, q.Order)
+		if !ok {
+			return nil, false, false
+		}
+		lo, hi, ok := bounds(d, len(sub), prefix, rev, q)
+		if !ok {
+			return nil, false, false
+		}
+		// `in [x, x]` is legal and must not return x twice. Ranges are keyed by
+		// their prefix, so duplicates collapse here rather than becoming
+		// duplicate rows the caller would have to dedupe.
+		if k := string(prefix); seen[k] {
+			continue
+		} else {
+			seen[k] = true
+		}
+		reversed = rev
+		ranges = append(ranges, Range{Lo: lo, Hi: hi, SuffixFrom: len(prefix)})
+	}
+	if len(ranges) == 0 {
+		// Every value was null or NaN: the query matches nothing, and an empty
+		// range set says so without a scan.
+		return []Range{}, false, true
+	}
+	return ranges, reversed, true
+}
+
+func collect(f *pb.StructuredQuery_Filter, eq map[string]*pb.Value, ineq **inequality, in **inList) bool {
 	if f == nil {
 		return true
 	}
@@ -353,7 +451,7 @@ func collect(f *pb.StructuredQuery_Filter, eq map[string]*pb.Value, ineq **inequ
 			return false
 		}
 		for _, sub := range t.CompositeFilter.GetFilters() {
-			if !collect(sub, eq, ineq) {
+			if !collect(sub, eq, ineq, in) {
 				return false
 			}
 		}
@@ -391,6 +489,16 @@ func collect(f *pb.StructuredQuery_Filter, eq map[string]*pb.Value, ineq **inequ
 			}
 			*ineq = &inequality{path: path, op: op, value: ff.GetValue()}
 			return true
+		case pb.StructuredQuery_FieldFilter_IN:
+			if *in != nil {
+				return false // one in-field only: two would need a cross product
+			}
+			vals := ff.GetValue().GetArrayValue().GetValues()
+			if len(vals) == 0 {
+				return false
+			}
+			*in = &inList{path: path, values: vals}
+			return true
 		default:
 			return false
 		}
@@ -406,4 +514,12 @@ func capVals(vals []*pb.Value, n int) []*pb.Value {
 		return vals[:n]
 	}
 	return vals
+}
+
+// GetRanges is a nil-safe accessor used by diagnostics.
+func (p *Plan) GetRanges() []Range {
+	if p == nil {
+		return nil
+	}
+	return p.Ranges
 }

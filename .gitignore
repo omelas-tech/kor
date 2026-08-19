@@ -4,3 +4,8 @@
 *.out
 .DS_Store
 /dist/
+
+# Firestore emulator logs (differential fuzz runs)
+firebase-debug.log
+firestore-debug.log
+ui-debug.log

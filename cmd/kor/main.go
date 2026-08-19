@@ -229,6 +229,11 @@ func korClient(ctx context.Context, cf copyFlags) *firestore.Client {
 // durable reports the last id the caller has durably persisted (for the
 // importer, the last committed doc). Retries resume from it rather than from
 // the failed attempt's own progress, which may be empty.
+// pageBytes caps how much payload one page may stream. Sized well under the
+// amount Firestore can deliver inside its query deadline, with room for
+// collections whose documents are far larger than average.
+const pageBytes = 24 << 20 // 24 MiB
+
 func forEachDoc(ctx context.Context, src *firestore.Client, collection, startAfter string, durable func() string, fn func(*firestore.DocumentSnapshot) error) (last string, total int, err error) {
 	const pageSize = 3000
 	cursor := startAfter
@@ -239,9 +244,10 @@ func forEachDoc(ctx context.Context, src *firestore.Client, collection, startAft
 		}
 		var pageDocs int
 		var pageErr error
+		var pageCapped bool
 		for attempt := 1; attempt <= 4; attempt++ {
 			var pageLast string
-			pageDocs, pageLast, pageErr = readPage(ctx, q, fn)
+			pageDocs, pageLast, pageCapped, pageErr = readPage(ctx, q, fn)
 			if pageErr == nil {
 				cursor = pageLast
 				break
@@ -267,7 +273,7 @@ func forEachDoc(ctx context.Context, src *firestore.Client, collection, startAft
 			return cursor, total, pageErr
 		}
 		total += pageDocs
-		if pageDocs < pageSize {
+		if pageDocs < pageSize && !pageCapped {
 			return cursor, total, nil
 		}
 	}
@@ -302,22 +308,40 @@ func estimateSize(v any) int {
 	}
 }
 
-func readPage(ctx context.Context, q firestore.Query, fn func(*firestore.DocumentSnapshot) error) (n int, last string, err error) {
+// readPage streams one page, stopping early once pageBytes of payload have been
+// read.
+//
+// The byte cap is the same reasoning the commit batch already uses, applied to
+// the read side, and it is not optional at these document sizes: a fixed
+// 3000-document page over a collection averaging 38 kB streams ~114 MB in a
+// single query, and Firestore kills it with "Query timed out" long before the
+// end. Capping by bytes turns one impossible page into several ordinary ones.
+//
+// capped distinguishes "stopped on the byte budget" from "reached the end of
+// the collection", which the caller uses to decide whether to continue. Without
+// it a byte-capped short page reads as the end of the scan, silently importing
+// a fraction of the collection and reporting success.
+func readPage(ctx context.Context, q firestore.Query, fn func(*firestore.DocumentSnapshot) error) (n int, last string, capped bool, err error) {
 	it := q.Documents(ctx)
 	defer it.Stop()
+	bytes := 0
 	for {
 		snap, err := it.Next()
 		if err == iterator.Done {
-			return n, last, nil
+			return n, last, false, nil
 		}
 		if err != nil {
-			return n, last, err
+			return n, last, false, err
 		}
 		if err := fn(snap); err != nil {
-			return n, last, err
+			return n, last, false, err
 		}
 		n++
 		last = snap.Ref.ID
+		bytes += estimateSize(snap.Data())
+		if bytes >= pageBytes {
+			return n, last, true, nil
+		}
 	}
 }
 

@@ -630,3 +630,79 @@ func TestContainsAndEqualityIndexesAreNotInterchangeable(t *testing.T) {
 		t.Error("the array-contains index should serve its own query")
 	}
 }
+
+// array-contains-any is the multi-range shape again, but its ranges OVERLAP: a
+// document whose array holds two of the values matches twice. Firestore returns
+// it once, so the merge must dedupe — and because duplicates collapse, a
+// bounded per-range prefetch would silently return a short page.
+func TestIndexedArrayContainsAnyMatchesGeneralPath(t *testing.T) {
+	s := openStore(t)
+	ctx := context.Background()
+
+	d := index.Def{CollectionID: "chats", Fields: []index.Field{
+		{Path: "tags", Contains: true}, {Path: "rank"},
+	}}
+	defs := []index.Def{d}
+	if err := s.SetIndexes(ctx, defs); err != nil {
+		t.Fatal(err)
+	}
+	arr := func(vs ...*pb.Value) *pb.Value {
+		return &pb.Value{ValueType: &pb.Value_ArrayValue{ArrayValue: &pb.ArrayValue{Values: vs}}}
+	}
+	docs := []map[string]*pb.Value{
+		{"tags": arr(sval("a")), "rank": ival(1)},
+		{"tags": arr(sval("b")), "rank": ival(2)},
+		// Holds BOTH queried values: must appear exactly once.
+		{"tags": arr(sval("a"), sval("b")), "rank": ival(3)},
+		{"tags": arr(sval("a"), sval("b"), sval("c")), "rank": ival(4)},
+		{"tags": arr(sval("c")), "rank": ival(5)},
+		{"tags": arr(), "rank": ival(6)},
+		{"rank": ival(7)},
+	}
+	for i, doc := range docs {
+		setDoc(t, s, fmt.Sprintf("%s/chats/c%02d", idxParent, i), doc)
+	}
+	if _, err := s.BackfillIndex(ctx, d); err != nil {
+		t.Fatal(err)
+	}
+
+	anyOf := func(vs ...*pb.Value) *pb.StructuredQuery_Filter {
+		return cmpFilter("tags", pb.StructuredQuery_FieldFilter_ARRAY_CONTAINS_ANY,
+			&pb.Value{ValueType: &pb.Value_ArrayValue{ArrayValue: &pb.ArrayValue{Values: vs}}})
+	}
+	cases := []struct {
+		name string
+		sq   *pb.StructuredQuery
+	}{
+		{"overlapping matches counted once", &pb.StructuredQuery{
+			From: from("chats"), Where: anyOf(sval("a"), sval("b")),
+			OrderBy: []*pb.StructuredQuery_Order{orderBy("rank", pb.StructuredQuery_ASCENDING)},
+		}},
+		{"descending", &pb.StructuredQuery{
+			From: from("chats"), Where: anyOf(sval("a"), sval("b")),
+			OrderBy: []*pb.StructuredQuery_Order{orderBy("rank", pb.StructuredQuery_DESCENDING)},
+		}},
+		{"three values", &pb.StructuredQuery{
+			From: from("chats"), Where: anyOf(sval("a"), sval("b"), sval("c")),
+			OrderBy: []*pb.StructuredQuery_Order{orderBy("rank", pb.StructuredQuery_ASCENDING)},
+		}},
+		// The page is drawn after dedup, so a bounded prefetch would short it.
+		{"limit after dedup", &pb.StructuredQuery{
+			From: from("chats"), Where: anyOf(sval("a"), sval("b"), sval("c")),
+			OrderBy: []*pb.StructuredQuery_Order{orderBy("rank", pb.StructuredQuery_ASCENDING)},
+			Limit:   wrapperspb.Int32(3),
+		}},
+		{"limit and offset after dedup", &pb.StructuredQuery{
+			From: from("chats"), Where: anyOf(sval("a"), sval("b"), sval("c")),
+			OrderBy: []*pb.StructuredQuery_Order{orderBy("rank", pb.StructuredQuery_ASCENDING)},
+			Limit:   wrapperspb.Int32(2), Offset: 2,
+		}},
+		{"no matches", &pb.StructuredQuery{
+			From: from("chats"), Where: anyOf(sval("zz")),
+			OrderBy: []*pb.StructuredQuery_Order{orderBy("rank", pb.StructuredQuery_ASCENDING)},
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) { bothWays(t, s, defs, mkQuery(t, tc.sq)) })
+	}
+}

@@ -35,6 +35,10 @@ type Plan struct {
 	// document can appear twice.
 	Ranges   []Range
 	Reversed bool // scan descending
+	// Dedup is set when ranges can overlap on the same document, which happens
+	// only for array-contains-any: a document whose array holds two of the
+	// values appears once per matching element, and Firestore returns it once.
+	Dedup bool
 }
 
 // Range is one contiguous scan [Lo, Hi). SuffixFrom is where this range's
@@ -91,7 +95,8 @@ func For(q *query.Query, defs []Def, ready map[int64]bool) (*Plan, bool) {
 		if !ok {
 			continue
 		}
-		return &Plan{Def: d, Ranges: ranges, Reversed: reversed}, true
+		return &Plan{Def: d, Ranges: ranges, Reversed: reversed,
+			Dedup: in != nil && in.contains}, true
 	}
 	return nil, false
 }
@@ -359,6 +364,11 @@ func splitFilters(q *query.Query) (eq map[string]*pb.Value, ineq *inequality, in
 		return nil, nil, nil, false
 	}
 	if contains != nil {
+		// Consistent with Matches: neither null nor NaN can be found inside an
+		// array, so such a filter is unservable rather than a prefix lookup.
+		if value.IsNull(contains.value) || value.IsNaN(contains.value) {
+			return nil, nil, nil, false
+		}
 		// An array-contains value occupies a prefix position exactly like an
 		// equality; match() then requires the definition to mark that field as
 		// a contains component, so the two cannot be confused.
@@ -395,6 +405,11 @@ func splitFilters(q *query.Query) (eq map[string]*pb.Value, ineq *inequality, in
 type inList struct {
 	path   string
 	values []*pb.Value
+	// contains marks array-contains-any rather than `in`. The range machinery
+	// is identical; what differs is that a document can satisfy SEVERAL values
+	// at once (its array holding two of them), so the ranges overlap and the
+	// merge must dedupe. `in` ranges are disjoint by construction.
+	contains bool
 }
 
 // containsFilter is a single array-contains filter.
@@ -408,10 +423,16 @@ func containsPath(q *query.Query) (string, bool) {
 	var ineq *inequality
 	var in *inList
 	var c *containsFilter
-	if !collect(q.Where, map[string]*pb.Value{}, &ineq, &in, &c) || c == nil {
+	if !collect(q.Where, map[string]*pb.Value{}, &ineq, &in, &c) {
 		return "", false
 	}
-	return c.path, true
+	if c != nil {
+		return c.path, true
+	}
+	if in != nil && in.contains {
+		return in.path, true
+	}
+	return "", false
 }
 
 // planRanges builds the scan ranges for one definition.
@@ -443,8 +464,9 @@ func planRanges(d Def, eq map[string]*pb.Value, in *inList, q *query.Query) ([]R
 	var reversed bool
 	seen := map[string]bool{}
 	for _, v := range in.values {
-		// Firestore matches neither null nor NaN through `in`, so a range for
-		// either would return documents the general path excludes.
+		// Firestore matches neither null nor NaN through `in` or
+		// array-contains-any, so a range for either would return documents the
+		// general path excludes.
 		if value.IsNull(v) || value.IsNaN(v) {
 			continue
 		}
@@ -530,15 +552,17 @@ func collect(f *pb.StructuredQuery_Filter, eq map[string]*pb.Value, ineq **inequ
 			}
 			*contains = &containsFilter{path: path, value: ff.GetValue()}
 			return true
-		case pb.StructuredQuery_FieldFilter_IN:
+		case pb.StructuredQuery_FieldFilter_IN,
+			pb.StructuredQuery_FieldFilter_ARRAY_CONTAINS_ANY:
 			if *in != nil {
-				return false // one in-field only: two would need a cross product
+				return false // one such field only: two would need a cross product
 			}
 			vals := ff.GetValue().GetArrayValue().GetValues()
 			if len(vals) == 0 {
 				return false
 			}
-			*in = &inList{path: path, values: vals}
+			*in = &inList{path: path, values: vals,
+				contains: ff.GetOp() == pb.StructuredQuery_FieldFilter_ARRAY_CONTAINS_ANY}
 			return true
 		default:
 			return false

@@ -399,10 +399,23 @@ func evalFieldFilter(ff *pb.StructuredQuery_FieldFilter, name string, fields map
 		return true
 
 	case pb.StructuredQuery_FieldFilter_ARRAY_CONTAINS:
+		// Neither null nor NaN can be searched for inside an array. The SDKs
+		// reject it client-side, but the server must not rely on that: a
+		// direct RPC would otherwise match documents whose array holds null.
+		if value.IsNull(operand) || value.IsNaN(operand) {
+			return false
+		}
 		return arrayContains(v, operand)
 
 	case pb.StructuredQuery_FieldFilter_ARRAY_CONTAINS_ANY:
 		for _, el := range operand.GetArrayValue().GetValues() {
+			// A null or NaN in the list is IGNORED, not fatal to the query:
+			// the emulator answers `array-contains-any ["a", null]` with the
+			// documents holding "a", and `array-contains-any [null]` with
+			// none. Same asymmetry as `in`.
+			if value.IsNull(el) || value.IsNaN(el) {
+				continue
+			}
 			if arrayContains(v, el) {
 				return true
 			}

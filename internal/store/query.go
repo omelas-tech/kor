@@ -436,9 +436,14 @@ func (s *Store) scanIndex(ctx context.Context, q *query.Query, plan *index.Plan)
 	// position in its own range cannot appear within the page after merging.
 	// Total rows read is k*(offset+limit) rather than every matching document.
 	perRange := int32(-1)
-	if q.Limit >= 0 {
+	if q.Limit >= 0 && !plan.Dedup {
 		perRange = q.Limit + q.Offset
 	}
+	// With dedup on, per-range prefetching is unsound: duplicates collapse
+	// during the merge, so a page can need more rows from a range than
+	// offset+limit, and a bounded prefetch would silently return a short page.
+	// Reading each range in full still avoids fetching the documents, which is
+	// where the real cost is.
 	streams := make([][]indexRow, 0, len(plan.Ranges))
 	for _, r := range plan.Ranges {
 		rows, err := s.scanRange(ctx, plan, r, perRange, 0)
@@ -449,7 +454,7 @@ func (s *Store) scanIndex(ctx context.Context, q *query.Query, plan *index.Plan)
 			streams = append(streams, rows)
 		}
 	}
-	return mergeRanges(streams, plan.Reversed, q.Limit, q.Offset), nil
+	return mergeRanges(streams, plan.Reversed, q.Limit, q.Offset, plan.Dedup), nil
 }
 
 // indexRow is one index entry: the document it points at, and the part of its
@@ -507,7 +512,11 @@ func (s *Store) scanRange(ctx context.Context, plan *index.Plan, r index.Range, 
 // the in-list value rather than by what the query asked to order by — grouping
 // results by value instead of interleaving them, which is wrong and looks
 // plausible.
-func mergeRanges(streams [][]indexRow, reversed bool, limit, offset int32) []string {
+func mergeRanges(streams [][]indexRow, reversed bool, limit, offset int32, dedup bool) []string {
+	var seen map[string]bool
+	if dedup {
+		seen = map[string]bool{}
+	}
 	pos := make([]int, len(streams))
 	var out []string
 	skipped := int32(0)
@@ -534,6 +543,14 @@ func mergeRanges(streams [][]indexRow, reversed bool, limit, offset int32) []str
 		}
 		row := streams[best][pos[best]]
 		pos[best]++
+		if seen != nil {
+			// array-contains-any: one document can satisfy several values, so
+			// it appears once per matching element. Firestore returns it once.
+			if seen[row.name] {
+				continue
+			}
+			seen[row.name] = true
+		}
 		if skipped < offset {
 			skipped++
 			continue

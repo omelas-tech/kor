@@ -439,9 +439,9 @@ func generateSpecs(rnd *rand.Rand, fields []string, vals []any, ops []string, n 
 					return tail(c.Where(f1, "not-in", []any{a, b}).OrderBy(f1, d1))
 				}
 			} else {
-				desc = fmt.Sprintf("where %s array-contains-any [%v %v] | orderBy __name__", f1, a, b)
+				desc = fmt.Sprintf("where tags array-contains-any [%v %v] | orderBy %s", a, b, f1)
 				build = func(c firestore.CollectionRef) firestore.Query {
-					return tail(c.Where(f1, "array-contains-any", []any{a, b}).OrderBy(firestore.DocumentID, d1))
+					return tail(c.Where("tags", "array-contains-any", []any{a, b}).OrderBy(f1, d1))
 				}
 			}
 		case 6: // nested field path: a different parse and a different jsonb probe

@@ -70,7 +70,16 @@ func ParseConfig(r io.Reader) ([]Def, []Skipped, error) {
 		for _, ff := range fi.Fields {
 			switch {
 			case ff.ArrayConfig != "":
-				reason = "array-contains index: an inverted index over element values, not an ordering"
+				if !strings.EqualFold(ff.ArrayConfig, "CONTAINS") {
+					reason = fmt.Sprintf("unsupported arrayConfig %q", ff.ArrayConfig)
+					break
+				}
+				if _, dup := d.ContainsPath(); dup {
+					reason = "more than one array-contains field"
+					break
+				}
+				d.Fields = append(d.Fields, Field{Path: ff.FieldPath, Contains: true})
+				continue
 			case len(ff.VectorConfig) > 0:
 				reason = "vector index: an approximate-nearest-neighbour structure, not an ordering"
 			case ff.FieldPath == "":
@@ -136,6 +145,8 @@ func ParseSpec(spec string) (Def, error) {
 			d.Fields = append(d.Fields, Field{Path: path})
 		case "desc":
 			d.Fields = append(d.Fields, Field{Path: path, Desc: true})
+		case "contains":
+			d.Fields = append(d.Fields, Field{Path: path, Contains: true})
 		default:
 			return Def{}, fmt.Errorf("index: malformed direction %q in spec %q", dir, spec)
 		}

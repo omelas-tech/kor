@@ -368,6 +368,9 @@ func (s *Store) runIndexed(ctx context.Context, q *query.Query, plan *index.Plan
 	if len(plan.Ranges) > 1 {
 		s.indexedMerged.Add(1)
 	}
+	if _, ok := plan.Def.ContainsPath(); ok {
+		s.indexedContains.Add(1)
+	}
 
 	names, err := s.scanIndex(ctx, q, plan)
 	if err != nil {

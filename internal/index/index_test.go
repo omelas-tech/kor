@@ -51,11 +51,11 @@ func TestSpecAndIDAreStableAndDistinct(t *testing.T) {
 
 func TestKeyOmitsDocumentsMissingAnIndexedField(t *testing.T) {
 	d := def(Field{Path: "a"}, Field{Path: "b"})
-	if _, ok := d.Key("docs/1", map[string]*pb.Value{"a": str("x")}); ok {
+	if _, ok := keyOf(d, "docs/1", map[string]*pb.Value{"a": str("x")}); ok {
 		t.Error("a document missing an indexed field must be omitted — this is why " +
 			"an orderBy silently excludes documents lacking that field")
 	}
-	if _, ok := d.Key("docs/1", map[string]*pb.Value{"a": str("x"), "b": num(1)}); !ok {
+	if _, ok := keyOf(d, "docs/1", map[string]*pb.Value{"a": str("x"), "b": num(1)}); !ok {
 		t.Error("a document with every indexed field must be included")
 	}
 }
@@ -82,7 +82,7 @@ func TestKeyOrderMatchesFirestoreOrder(t *testing.T) {
 		for j, b := range vals {
 			name := "projects/p/databases/(default)/documents/c/" + string(rune('a'+i)) + string(rune('a'+j))
 			fields := map[string]*pb.Value{"a": a, "b": b}
-			k, ok := d.Key(name, fields)
+			k, ok := keyOf(d, name, fields)
 			if !ok {
 				t.Fatalf("key build failed for %v/%v", a, b)
 			}
@@ -124,7 +124,7 @@ func TestDescendingFieldReversesOrder(t *testing.T) {
 	desc := def(Field{Path: "a", Desc: true})
 
 	mk := func(d Def, v *pb.Value, name string) []byte {
-		k, ok := d.Key(name, map[string]*pb.Value{"a": v})
+		k, ok := keyOf(d, name, map[string]*pb.Value{"a": v})
 		if !ok {
 			t.Fatal("key build failed")
 		}
@@ -154,11 +154,11 @@ func TestPrefixScanIsolatesEqualityGroup(t *testing.T) {
 
 	var in, out [][]byte
 	for _, b := range []int64{1, 2, 3} {
-		k, _ := d.Key(base+"in", map[string]*pb.Value{"a": str("X"), "b": num(b)})
+		k, _ := keyOf(d, base+"in", map[string]*pb.Value{"a": str("X"), "b": num(b)})
 		in = append(in, k)
 	}
 	for _, a := range []string{"W", "Y"} {
-		k, _ := d.Key(base+"out", map[string]*pb.Value{"a": str(a), "b": num(2)})
+		k, _ := keyOf(d, base+"out", map[string]*pb.Value{"a": str(a), "b": num(2)})
 		out = append(out, k)
 	}
 
@@ -192,4 +192,14 @@ func TestPrefixEnd(t *testing.T) {
 	if got := PrefixEnd(nil); got != nil {
 		t.Errorf("an empty prefix has no upper bound, got %v", got)
 	}
+}
+
+// keyOf adapts these tests, which describe the ordinary one-key-per-document
+// case, to Keys — which returns several only for an array-contains definition.
+func keyOf(d Def, name string, fields map[string]*pb.Value) ([]byte, bool) {
+	ks := d.Keys(name, fields)
+	if len(ks) != 1 {
+		return nil, false
+	}
+	return ks[0], true
 }

@@ -103,7 +103,7 @@ func For(q *query.Query, defs []Def, ready map[int64]bool) (*Plan, bool) {
 // in the range — and continue with exactly the query's ordering terms, in
 // order. Directions must either all agree or all oppose: a scan can run
 // backwards, but it cannot reverse one field and not another.
-func match(d Def, eq map[string]*pb.Value, order []query.OrderSpec) (prefix []byte, reversed bool, ok bool) {
+func match(d Def, eq map[string]*pb.Value, cPath string, order []query.OrderSpec) (prefix []byte, reversed bool, ok bool) {
 	// Match against the index's EFFECTIVE fields, which include the implicit
 	// __name__ terminator Key() appends. query.Parse likewise appends __name__
 	// to every effective ordering, so without this the two lists are always
@@ -122,6 +122,13 @@ func match(d Def, eq map[string]*pb.Value, order []query.OrderSpec) (prefix []by
 		f := fields[i]
 		v, isEq := eq[f.Path]
 		if !isEq {
+			return nil, false, false
+		}
+		// A contains component and an equality component are different index
+		// shapes — one entry per element versus one per document — so a query
+		// filtering with `==` must not be served by an array-contains index,
+		// nor the reverse.
+		if f.Contains != (cPath != "" && f.Path == cPath) {
 			return nil, false, false
 		}
 		eqValues = append(eqValues, v)
@@ -347,8 +354,18 @@ func minBound(a, b []byte) []byte {
 // quietly omits results.
 func splitFilters(q *query.Query) (eq map[string]*pb.Value, ineq *inequality, in *inList, ok bool) {
 	eq = map[string]*pb.Value{}
-	if !collect(q.Where, eq, &ineq, &in) {
+	var contains *containsFilter
+	if !collect(q.Where, eq, &ineq, &in, &contains) {
 		return nil, nil, nil, false
+	}
+	if contains != nil {
+		// An array-contains value occupies a prefix position exactly like an
+		// equality; match() then requires the definition to mark that field as
+		// a contains component, so the two cannot be confused.
+		if _, dup := eq[contains.path]; dup {
+			return nil, nil, nil, false
+		}
+		eq[contains.path] = contains.value
 	}
 	if ineq != nil {
 		// The inequality field must be the first ordering term, or the range it
@@ -380,6 +397,23 @@ type inList struct {
 	values []*pb.Value
 }
 
+// containsFilter is a single array-contains filter.
+type containsFilter struct {
+	path  string
+	value *pb.Value
+}
+
+// containsPath reports the array-contains field of a query, if any.
+func containsPath(q *query.Query) (string, bool) {
+	var ineq *inequality
+	var in *inList
+	var c *containsFilter
+	if !collect(q.Where, map[string]*pb.Value{}, &ineq, &in, &c) || c == nil {
+		return "", false
+	}
+	return c.path, true
+}
+
 // planRanges builds the scan ranges for one definition.
 //
 // An `in` filter is exactly N equality filters unioned, so each value is
@@ -388,8 +422,9 @@ type inList struct {
 // handling are the parts most likely to be got wrong, and they stay in one
 // place rather than being reimplemented for the multi-range case.
 func planRanges(d Def, eq map[string]*pb.Value, in *inList, q *query.Query) ([]Range, bool, bool) {
+	cPath, _ := containsPath(q)
 	if in == nil {
-		prefix, reversed, ok := match(d, eq, q.Order)
+		prefix, reversed, ok := match(d, eq, cPath, q.Order)
 		if !ok {
 			return nil, false, false
 		}
@@ -414,7 +449,7 @@ func planRanges(d Def, eq map[string]*pb.Value, in *inList, q *query.Query) ([]R
 			continue
 		}
 		sub[in.path] = v
-		prefix, rev, ok := match(d, sub, q.Order)
+		prefix, rev, ok := match(d, sub, cPath, q.Order)
 		if !ok {
 			return nil, false, false
 		}
@@ -441,7 +476,7 @@ func planRanges(d Def, eq map[string]*pb.Value, in *inList, q *query.Query) ([]R
 	return ranges, reversed, true
 }
 
-func collect(f *pb.StructuredQuery_Filter, eq map[string]*pb.Value, ineq **inequality, in **inList) bool {
+func collect(f *pb.StructuredQuery_Filter, eq map[string]*pb.Value, ineq **inequality, in **inList, contains **containsFilter) bool {
 	if f == nil {
 		return true
 	}
@@ -451,7 +486,7 @@ func collect(f *pb.StructuredQuery_Filter, eq map[string]*pb.Value, ineq **inequ
 			return false
 		}
 		for _, sub := range t.CompositeFilter.GetFilters() {
-			if !collect(sub, eq, ineq, in) {
+			if !collect(sub, eq, ineq, in, contains) {
 				return false
 			}
 		}
@@ -488,6 +523,12 @@ func collect(f *pb.StructuredQuery_Filter, eq map[string]*pb.Value, ineq **inequ
 				op = lte
 			}
 			*ineq = &inequality{path: path, op: op, value: ff.GetValue()}
+			return true
+		case pb.StructuredQuery_FieldFilter_ARRAY_CONTAINS:
+			if *contains != nil {
+				return false // one array-contains field only, as Firestore requires
+			}
+			*contains = &containsFilter{path: path, value: ff.GetValue()}
 			return true
 		case pb.StructuredQuery_FieldFilter_IN:
 			if *in != nil {

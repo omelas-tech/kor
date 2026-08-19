@@ -33,6 +33,10 @@ import (
 type Field struct {
 	Path string // field path, or "__name__" for the document name
 	Desc bool
+	// Contains marks an array-contains component. Such a field is not ordered;
+	// it fans a document out into one entry per distinct array element, which
+	// is what makes `array-contains` a prefix lookup rather than a scan.
+	Contains bool
 }
 
 // Def is a composite index definition.
@@ -64,7 +68,9 @@ func (d Def) Spec() string {
 	for _, f := range d.Fields {
 		b.WriteByte('|')
 		b.WriteString(f.Path)
-		if f.Desc {
+		if f.Contains {
+			b.WriteString(" contains")
+		} else if f.Desc {
 			b.WriteString(" desc")
 		} else {
 			b.WriteString(" asc")
@@ -93,42 +99,90 @@ func (d Def) trailingDirection() bool {
 	if len(d.Fields) == 0 {
 		return false
 	}
+	if d.Fields[len(d.Fields)-1].Contains {
+		return false // a contains component carries no direction
+	}
 	return d.Fields[len(d.Fields)-1].Desc
 }
 
-// Key builds the index key for one document.
+// Keys builds the index keys for one document — normally exactly one.
 //
-// Returns ok=false when the document does not belong in this index: Firestore
+// Returns nothing when the document does not belong in this index: Firestore
 // omits a document from an index if any indexed field is absent, which is why
 // an orderBy silently excludes documents missing that field. Reproducing that
 // here is what keeps index-backed results identical to the general path.
-func (d Def) Key(name string, fields map[string]*pb.Value) (key []byte, ok bool) {
-	key = make([]byte, 0, 64)
+//
+// An array-contains component fans out instead: one entry per DISTINCT element,
+// so `array-contains x` becomes an ordinary prefix lookup. Distinct matters —
+// an array may hold the same value twice, and two identical entries for one
+// document would collide on the primary key.
+func (d Def) Keys(name string, fields map[string]*pb.Value) [][]byte {
+	heads := [][]byte{make([]byte, 0, 64)}
 	for _, f := range d.Fields {
 		if f.Path == NameField {
-			key = appendName(key, name, f.Desc)
+			for i := range heads {
+				heads[i] = appendName(heads[i], name, f.Desc)
+			}
 			continue
 		}
 		fp, err := value.ParseFieldPath(f.Path)
 		if err != nil {
-			return nil, false
+			return nil
 		}
 		v, found := value.GetField(fields, fp)
 		if !found || v == nil {
-			return nil, false
+			return nil
 		}
-		if f.Desc {
-			key = value.AppendSortKeyDesc(key, v)
-		} else {
-			key = value.AppendSortKey(key, v)
+		if f.Contains {
+			arr := v.GetArrayValue()
+			if arr == nil {
+				return nil // not an array: array-contains can never match it
+			}
+			var next [][]byte
+			seen := map[string]bool{}
+			for _, el := range arr.GetValues() {
+				enc := value.AppendSortKey(nil, el)
+				if seen[string(enc)] {
+					continue
+				}
+				seen[string(enc)] = true
+				for _, h := range heads {
+					k := make([]byte, 0, len(h)+len(enc)+16)
+					next = append(next, append(append(k, h...), enc...))
+				}
+			}
+			if len(next) == 0 {
+				return nil // empty array indexes nothing
+			}
+			heads = next
+			continue
+		}
+		for i := range heads {
+			if f.Desc {
+				heads[i] = value.AppendSortKeyDesc(heads[i], v)
+			} else {
+				heads[i] = value.AppendSortKey(heads[i], v)
+			}
 		}
 	}
 	// Implicit __name__ terminator, unless the definition named it explicitly
 	// as its final component.
 	if len(d.Fields) == 0 || d.Fields[len(d.Fields)-1].Path != NameField {
-		key = appendName(key, name, d.trailingDirection())
+		for i := range heads {
+			heads[i] = appendName(heads[i], name, d.trailingDirection())
+		}
 	}
-	return key, true
+	return heads
+}
+
+// ContainsPath returns the array-contains field, if the definition has one.
+func (d Def) ContainsPath() (string, bool) {
+	for _, f := range d.Fields {
+		if f.Contains {
+			return f.Path, true
+		}
+	}
+	return "", false
 }
 
 func appendName(dst []byte, name string, desc bool) []byte {

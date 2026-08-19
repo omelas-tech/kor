@@ -21,18 +21,21 @@ func TestParseConfigReadsOrderedFields(t *testing.T) {
 	}
 }
 
-// An array-contains or vector index is a different data structure, not an
-// ordering. Approximating either would produce an index the planner accepts and
-// then serves wrong results from — strictly worse than not having it.
+// A vector index is an approximate-nearest-neighbour structure, not an
+// ordering, so it cannot be expressed as a sort-key range. Approximating it
+// would produce an index the planner accepts and then serves wrong results
+// from — strictly worse than not having it.
 func TestParseConfigSkipsUnservableKindsWithAReason(t *testing.T) {
-	_, skipped, err := ParseConfig(strings.NewReader(`{"indexes":[
-		{"collectionGroup":"posts","fields":[
-			{"fieldPath":"tags","arrayConfig":"CONTAINS"},
-			{"fieldPath":"score","order":"ASCENDING"}]},
+	defs, skipped, err := ParseConfig(strings.NewReader(`{"indexes":[
 		{"collectionGroup":"embeds","fields":[
-			{"fieldPath":"vec","vectorConfig":{"dimension":768}}]}]}`))
+			{"fieldPath":"vec","vectorConfig":{"dimension":768}}]},
+		{"collectionGroup":"weird","fields":[
+			{"fieldPath":"tags","arrayConfig":"SOMETHING_ELSE"}]}]}`))
 	if err != nil {
 		t.Fatal(err)
+	}
+	if len(defs) != 0 {
+		t.Fatalf("nothing here is servable, got %+v", defs)
 	}
 	if len(skipped) != 2 {
 		t.Fatalf("want 2 skips, got %v", skipped)
@@ -41,6 +44,42 @@ func TestParseConfigSkipsUnservableKindsWithAReason(t *testing.T) {
 		if s.Reason == "" {
 			t.Error("a skip without a reason becomes a query that mysteriously stays slow")
 		}
+	}
+}
+
+// array-contains IS servable: the component fans a document out into one entry
+// per element, which turns `array-contains x` into a prefix lookup.
+func TestParseConfigReadsArrayContains(t *testing.T) {
+	defs, skipped, err := ParseConfig(strings.NewReader(`{"indexes":[
+		{"collectionGroup":"chats","queryScope":"COLLECTION","fields":[
+			{"fieldPath":"participants","arrayConfig":"CONTAINS"},
+			{"fieldPath":"updatedAt","order":"DESCENDING"}]}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(skipped) != 0 {
+		t.Fatalf("unexpected skips: %v", skipped)
+	}
+	if len(defs) != 1 || defs[0].Spec() != "chats|participants contains|updatedAt desc" {
+		t.Fatalf("got %+v", defs)
+	}
+	if p, ok := defs[0].ContainsPath(); !ok || p != "participants" {
+		t.Errorf("ContainsPath = %q, %v", p, ok)
+	}
+}
+
+// Firestore allows one array-contains field per index; two would need a cross
+// product of elements, which is a different structure again.
+func TestParseConfigRejectsTwoArrayContainsFields(t *testing.T) {
+	defs, skipped, err := ParseConfig(strings.NewReader(`{"indexes":[
+		{"collectionGroup":"x","fields":[
+			{"fieldPath":"a","arrayConfig":"CONTAINS"},
+			{"fieldPath":"b","arrayConfig":"CONTAINS"}]}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(defs) != 0 || len(skipped) != 1 {
+		t.Fatalf("defs=%+v skipped=%v", defs, skipped)
 	}
 }
 

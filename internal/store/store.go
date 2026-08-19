@@ -35,6 +35,9 @@ type Store struct {
 	// ranges (an `in` filter). Separate because "an index was used" and "the
 	// merge path was exercised" are different claims.
 	indexedMerged atomic.Int64
+	// indexedContains counts index-served queries whose definition fans a
+	// document out per array element.
+	indexedContains atomic.Int64
 }
 
 // Doc is a stored document.

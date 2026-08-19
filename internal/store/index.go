@@ -117,18 +117,17 @@ func (s *Store) refreshIndexEntries(ctx context.Context, tx pgx.Tx, name, collec
 	}
 
 	for _, d := range defs {
-		key, ok := d.Key(name, fields)
-		if !ok {
-			// Missing an indexed field: Firestore omits the document from the
-			// index entirely, which is why an orderBy excludes documents
-			// lacking that field. Reproduced so index-backed results match the
-			// general path exactly.
-			continue
-		}
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO index_entries (index_id, key, doc_name) VALUES ($1, $2, $3)
-			ON CONFLICT DO NOTHING`, d.ID(), key, name); err != nil {
-			return fmt.Errorf("store: write index entry %s/%s: %w", d.Spec(), name, err)
+		// Normally one key. An array-contains definition yields one per
+		// distinct element, and none at all when an indexed field is missing:
+		// Firestore omits such a document from the index entirely, which is why
+		// an orderBy excludes documents lacking that field. Reproduced so
+		// index-backed results match the general path exactly.
+		for _, key := range d.Keys(name, fields) {
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO index_entries (index_id, key, doc_name) VALUES ($1, $2, $3)
+				ON CONFLICT DO NOTHING`, d.ID(), key, name); err != nil {
+				return fmt.Errorf("store: write index entry %s/%s: %w", d.Spec(), name, err)
+			}
 		}
 	}
 	return nil
@@ -176,7 +175,7 @@ func (s *Store) BackfillIndex(ctx context.Context, d index.Def) (int64, error) {
 			rows.Close()
 			return 0, fmt.Errorf("store: backfill decode %s: %w", name, err)
 		}
-		if key, ok := d.Key(name, fields); ok {
+		for _, key := range d.Keys(name, fields) {
 			batch = append(batch, pending{name, key})
 		}
 	}
@@ -370,3 +369,7 @@ func (s *Store) IndexedQueries() int64 { return s.indexedQueries.Load() }
 // IndexedMergedQueries counts index-served queries whose plan spanned more than
 // one range, i.e. those that went through the k-way merge.
 func (s *Store) IndexedMergedQueries() int64 { return s.indexedMerged.Load() }
+
+// IndexedContainsQueries counts index-served queries served by an
+// array-contains definition.
+func (s *Store) IndexedContainsQueries() int64 { return s.indexedContains.Load() }

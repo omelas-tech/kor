@@ -526,3 +526,107 @@ func TestIndexedInFilterMatchesGeneralPath(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) { bothWays(t, s, defs, mkQuery(t, tc.sq)) })
 	}
 }
+
+// An array-contains definition fans each document out into one entry per
+// distinct element, which turns `array-contains x` into an ordinary prefix
+// lookup. The failure modes are specific: an array holding a value twice must
+// not return the document twice, and a document whose field is not an array
+// must not be indexed at all.
+func TestIndexedArrayContainsMatchesGeneralPath(t *testing.T) {
+	s := openStore(t)
+	ctx := context.Background()
+
+	d := index.Def{CollectionID: "chats", Fields: []index.Field{
+		{Path: "participants", Contains: true}, {Path: "updatedAt", Desc: true},
+	}}
+	defs := []index.Def{d}
+	if err := s.SetIndexes(ctx, defs); err != nil {
+		t.Fatal(err)
+	}
+
+	arr := func(vs ...*pb.Value) *pb.Value {
+		return &pb.Value{ValueType: &pb.Value_ArrayValue{ArrayValue: &pb.ArrayValue{Values: vs}}}
+	}
+	docs := []map[string]*pb.Value{
+		{"participants": arr(sval("ann"), sval("bob")), "updatedAt": ival(5)},
+		{"participants": arr(sval("ann")), "updatedAt": ival(9)},
+		{"participants": arr(sval("bob"), sval("cat")), "updatedAt": ival(1)},
+		// The same value twice: one entry, one result.
+		{"participants": arr(sval("ann"), sval("ann")), "updatedAt": ival(7)},
+		{"participants": arr(), "updatedAt": ival(3)},                     // empty array: indexes nothing
+		{"participants": sval("ann"), "updatedAt": ival(4)},               // not an array at all
+		{"updatedAt": ival(2)},                                            // field missing
+		{"participants": arr(sval("ann"), ival(3)), "updatedAt": ival(8)}, // mixed element types
+	}
+	for i, doc := range docs {
+		setDoc(t, s, fmt.Sprintf("%s/chats/c%02d", idxParent, i), doc)
+	}
+	if _, err := s.BackfillIndex(ctx, d); err != nil {
+		t.Fatal(err)
+	}
+
+	contains := func(v *pb.Value) *pb.StructuredQuery_Filter {
+		return cmpFilter("participants", pb.StructuredQuery_FieldFilter_ARRAY_CONTAINS, v)
+	}
+	cases := []struct {
+		name string
+		sq   *pb.StructuredQuery
+	}{
+		{"string element desc", &pb.StructuredQuery{
+			From: from("chats"), Where: contains(sval("ann")),
+			OrderBy: []*pb.StructuredQuery_Order{orderBy("updatedAt", pb.StructuredQuery_DESCENDING)},
+		}},
+		{"string element asc", &pb.StructuredQuery{
+			From: from("chats"), Where: contains(sval("ann")),
+			OrderBy: []*pb.StructuredQuery_Order{orderBy("updatedAt", pb.StructuredQuery_ASCENDING)},
+		}},
+		{"element in several documents", &pb.StructuredQuery{
+			From: from("chats"), Where: contains(sval("bob")),
+			OrderBy: []*pb.StructuredQuery_Order{orderBy("updatedAt", pb.StructuredQuery_DESCENDING)},
+		}},
+		{"numeric element", &pb.StructuredQuery{
+			From: from("chats"), Where: contains(ival(3)),
+			OrderBy: []*pb.StructuredQuery_Order{orderBy("updatedAt", pb.StructuredQuery_DESCENDING)},
+		}},
+		{"no such element", &pb.StructuredQuery{
+			From: from("chats"), Where: contains(sval("nobody")),
+			OrderBy: []*pb.StructuredQuery_Order{orderBy("updatedAt", pb.StructuredQuery_DESCENDING)},
+		}},
+		{"with limit", &pb.StructuredQuery{
+			From: from("chats"), Where: contains(sval("ann")),
+			OrderBy: []*pb.StructuredQuery_Order{orderBy("updatedAt", pb.StructuredQuery_DESCENDING)},
+			Limit:   wrapperspb.Int32(2),
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) { bothWays(t, s, defs, mkQuery(t, tc.sq)) })
+	}
+}
+
+// An equality index and an array-contains index are different shapes — one
+// entry per document versus one per element — so neither may serve the other's
+// query. Confusing them returns documents whose field merely EQUALS the array,
+// or misses every document whose array contains the value.
+func TestContainsAndEqualityIndexesAreNotInterchangeable(t *testing.T) {
+	eqDef := index.Def{CollectionID: "chats", Fields: []index.Field{{Path: "participants"}}}
+	cDef := index.Def{CollectionID: "chats", Fields: []index.Field{{Path: "participants", Contains: true}}}
+	ready := map[int64]bool{eqDef.ID(): true, cDef.ID(): true}
+
+	eqQuery := mkQuery(t, &pb.StructuredQuery{
+		From: from("chats"), Where: eqFilter("participants", sval("ann")),
+	})
+	containsQuery := mkQuery(t, &pb.StructuredQuery{
+		From:  from("chats"),
+		Where: cmpFilter("participants", pb.StructuredQuery_FieldFilter_ARRAY_CONTAINS, sval("ann")),
+	})
+
+	if _, ok := index.For(eqQuery, []index.Def{cDef}, ready); ok {
+		t.Error("an array-contains index must not serve an == query")
+	}
+	if _, ok := index.For(containsQuery, []index.Def{eqDef}, ready); ok {
+		t.Error("an equality index must not serve an array-contains query")
+	}
+	if _, ok := index.For(containsQuery, []index.Def{cDef}, ready); !ok {
+		t.Error("the array-contains index should serve its own query")
+	}
+}

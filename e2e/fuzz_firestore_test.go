@@ -200,6 +200,10 @@ func runFuzz(t *testing.T, withIndexes bool) {
 	rnd := rand.New(rand.NewSource(seed))
 	t.Logf("fuzz seed %d (override with KOR_FUZZ_SEED)", seed)
 	vals := fuzzValues(rnd)
+	// Array elements must be scalars: Firestore rejects nested arrays outright,
+	// so a corpus containing one fails at write time rather than telling us
+	// anything about queries.
+	scalars := scalarValues(vals)
 	fields := []string{"a", "b", "c"}
 
 	const nDocs = 120
@@ -222,13 +226,36 @@ func runFuzz(t *testing.T, withIndexes bool) {
 		if len(nested) > 0 {
 			d["nested"] = nested
 		}
+		// An array field, so array-contains has something to fan out over.
+		// Occasionally NOT an array, and occasionally absent, because both are
+		// cases an array-contains index must exclude rather than mis-handle.
+		switch rnd.Intn(10) {
+		case 0:
+		case 1:
+			d["tags"] = "notanarray"
+		default:
+			n := rnd.Intn(4)
+			tags := make([]any, 0, n)
+			for j := 0; j < n; j++ {
+				tags = append(tags, scalars[rnd.Intn(len(scalars))])
+			}
+			d["tags"] = tags
+		}
 		docs[i] = d
 	}
 	if withIndexes {
 		// Register BEFORE writing, so entries are maintained on write, then
 		// backfill anyway — that is the order an operator would use and it
 		// exercises both maintenance paths.
-		var defs []index.Def
+		defs := []index.Def{
+			{CollectionID: coll, Fields: []index.Field{{Path: "tags", Contains: true}}},
+		}
+		for _, f := range fields {
+			defs = append(defs,
+				index.Def{CollectionID: coll, Fields: []index.Field{{Path: "tags", Contains: true}, {Path: f}}},
+				index.Def{CollectionID: coll, Fields: []index.Field{{Path: "tags", Contains: true}, {Path: f, Desc: true}}},
+			)
+		}
 		for _, f := range fields {
 			defs = append(defs,
 				index.Def{CollectionID: coll, Fields: []index.Field{{Path: f}}},
@@ -267,6 +294,7 @@ func runFuzz(t *testing.T, withIndexes bool) {
 	specs := generateSpecs(rnd, fields, vals, ops, 1200)
 
 	before, beforeMerged := st.IndexedQueries(), st.IndexedMergedQueries()
+	beforeContains := st.IndexedContainsQueries()
 	var mismatches, korOnlyErr, emuOnlyErr int
 	for i, sp := range specs {
 		korIDs, korErr := runIDs(ctx, sp.build(*kor.Collection(coll)))
@@ -298,10 +326,14 @@ func runFuzz(t *testing.T, withIndexes bool) {
 	}
 	served := st.IndexedQueries() - before
 	merged := st.IndexedMergedQueries() - beforeMerged
-	t.Logf("index-served queries: %d (of which merged: %d)", served, merged)
+	contains := st.IndexedContainsQueries() - beforeContains
+	t.Logf("index-served queries: %d (merged: %d, array-contains: %d)", served, merged, contains)
 	if withIndexes && served == 0 {
 		t.Error("no query was served from an index, so this run duplicates the general-path run " +
 			"and proves nothing about the index path")
+	}
+	if withIndexes && contains == 0 {
+		t.Error("no query was served by an array-contains index, so element fan-out is untested here")
 	}
 	if withIndexes && merged == 0 {
 		t.Error("no query exercised the multi-range merge, so `in` support is untested here")
@@ -428,9 +460,9 @@ func generateSpecs(rnd *rand.Rand, fields []string, vals []any, ops []string, n 
 		// array-contains and `in` went untested for a while here.
 		default: // array-contains and in, which take different evaluation paths
 			if rnd.Intn(2) == 0 {
-				desc = fmt.Sprintf("where %s array-contains %v | orderBy __name__", f1, v)
+				desc = fmt.Sprintf("where tags array-contains %v | orderBy %s", v, f1)
 				build = func(c firestore.CollectionRef) firestore.Query {
-					return tail(c.Where(f1, "array-contains", v).OrderBy(firestore.DocumentID, d1))
+					return tail(c.Where("tags", "array-contains", v).OrderBy(f1, d1))
 				}
 			} else {
 				a, b := val(), val()
@@ -447,4 +479,19 @@ func generateSpecs(rnd *rand.Rand, fields []string, vals []any, ops []string, n 
 		specs = append(specs, spec{desc: desc, build: build})
 	}
 	return specs
+}
+
+// scalarValues drops the composite members of the value set. Firestore forbids
+// a nested array, and a map inside an array makes element equality depend on
+// map ordering rules that array-contains does not exercise.
+func scalarValues(vals []any) []any {
+	out := make([]any, 0, len(vals))
+	for _, v := range vals {
+		switch v.(type) {
+		case []any, map[string]any:
+			continue
+		}
+		out = append(out, v)
+	}
+	return out
 }

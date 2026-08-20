@@ -6,8 +6,6 @@
 package query
 
 import (
-	"strings"
-
 	pb "cloud.google.com/go/firestore/apiv1/firestorepb"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -547,14 +545,4 @@ func (q *Query) ApplyProjection(fields map[string]*pb.Value) map[string]*pb.Valu
 		}
 	}
 	return out
-}
-
-// ParentDatabasePath returns "projects/P/databases/D/documents" for any
-// parent resource name below it.
-func ParentDatabasePath(parent string) string {
-	const marker = "/documents"
-	if i := strings.Index(parent, marker); i >= 0 {
-		return parent[:i+len(marker)]
-	}
-	return parent
 }

@@ -310,10 +310,3 @@ func formatTimestamp(ts *timestamppb.Timestamp) (string, error) {
 	// Firestore is precise to microseconds; extra precision is rounded down.
 	return t.Truncate(time.Microsecond).UTC().Format(timestampLayout), nil
 }
-
-// CanonicalizeTimestamp returns the value Firestore would actually store for
-// a written timestamp (truncated to microseconds). Used so that round-trip
-// tests and write results match server behavior.
-func CanonicalizeTimestamp(ts *timestamppb.Timestamp) *timestamppb.Timestamp {
-	return timestamppb.New(ts.AsTime().Truncate(time.Microsecond))
-}

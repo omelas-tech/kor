@@ -470,22 +470,40 @@ func importIDs(ctx context.Context, cf copyFlags, src, dst *firestore.Client, id
 		if err != nil {
 			log.Fatalf("source GetAll: %v", err)
 		}
+		// Same byte cap as the full import: 100 refs of a wide mirror (TMDB
+		// movies ~24 KB, TV ~50 KB) build a Commit far past gRPC's 4 MB default
+		// and it dies as a deadline, not a size error.
+		const batchBytes = 2 << 20
 		batch := dst.Batch()
-		n := 0
+		n, batched := 0, 0
+		flush := func() {
+			if n == 0 {
+				return
+			}
+			if _, err := batch.Commit(ctx); err != nil {
+				log.Fatalf("kor commit: %v", err)
+			}
+			copied += n
+			batch = dst.Batch()
+			n, batched = 0, 0
+		}
 		for _, s := range snaps {
 			if !s.Exists() {
 				missing++
 				log.Printf("MISSING in source: %s", s.Ref.ID)
 				continue
 			}
-			batch.Set(dst.Collection(cf.collection).Doc(s.Ref.ID), s.Data())
+			data := s.Data()
+			batch.Set(dst.Collection(cf.collection).Doc(s.Ref.ID), data)
 			n++
-		}
-		if n > 0 {
-			if _, err := batch.Commit(ctx); err != nil {
-				log.Fatalf("kor commit: %v", err)
+			batched += estimateSize(data)
+			if batched >= batchBytes {
+				flush()
 			}
-			copied += n
+		}
+		flush()
+		if copied > 0 && copied%5000 < 100 {
+			log.Printf("synced %d docs so far", copied)
 		}
 	}
 	log.Printf("SYNC DONE: %d copied, %d missing (of %d requested)", copied, missing, len(refs))

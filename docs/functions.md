@@ -55,6 +55,12 @@ trigger would mean reading every write in the database.
    three.
 5. The cursor is saved atomically after each page.
 
+Adding a collection to a running deployment is safe for the same reason. Events
+written before its triggers registered carry no images, so the runtime skips
+and counts them (`kor_functions_events_without_images_total`) instead of
+firing on history. A bulk import made just before the switch never triggers
+anything.
+
 **Delivery is at least once**, as on Cloud Functions. A crash replays the
 tail of the page it was handling. Events for one document arrive in commit
 order. Different documents are handled concurrently (`--concurrency`,

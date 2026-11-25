@@ -1,0 +1,14 @@
+{
+  "name": "@omelas/kor-functions",
+  "version": "0.1.0",
+  "description": "Run firebase-functions v2 Firestore triggers and scheduled functions, unchanged, against Kor's change feed",
+  "license": "Apache-2.0",
+  "bin": { "kor-functions": "bin/kor-functions.js" },
+  "main": "lib/runtime.js",
+  "files": ["bin", "lib"],
+  "engines": { "node": ">=20" },
+  "scripts": { "test": "node --test test/*.test.js" },
+  "repository": { "type": "git", "url": "https://github.com/omelas-tech/kor.git", "directory": "functions" },
+  "peerDependencies": { "firebase-admin": ">=12", "firebase-functions": ">=5" },
+  "peerDependenciesMeta": { "firebase-admin": { "optional": true }, "firebase-functions": { "optional": true } }
+}

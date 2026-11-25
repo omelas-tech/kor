@@ -98,6 +98,13 @@ production application's full API test suite passing against Kor unchanged):
   Firestore's write ceiling. Without the reverse direction a cutover is a
   one-way door: documents written after it exist only in Kor, so "point the app
   back at Firestore" silently loses them. Export replays writes, not deletes.
+- **A functions runtime** (`functions/`, `kor-functions`): runs a
+  `firebase-functions` v2 codebase unchanged. Firestore triggers fire from the
+  change feed, with the before and after documents captured inside the
+  writing transaction. `onSchedule` functions run on a time-zone-aware cron.
+  A hybrid router splits one `getFirestore()` instance between Kor and Google
+  Firestore by collection, so you can migrate one collection at a time. See
+  [docs/functions.md](docs/functions.md)
 
 Query execution note: a query whose shape matches a backfilled composite index
 scans `index_entries` in key order — which is query order — so only the
@@ -119,7 +126,7 @@ On the roadmap (in build order):
 | Phase | Scope |
 |---|---|
 | 1 | ~~Composite `index_entries` execution~~, ~~differential fuzzing vs the Google emulator~~ — both shipped |
-| 2 | Change-log + functions runtime (runs `firebase-functions` v2 code unchanged) + cron scheduler |
+| 2 | ~~Change-log~~, ~~functions runtime (runs `firebase-functions` v2 code unchanged)~~, ~~cron scheduler~~ — shipped, see [docs/functions.md](docs/functions.md) |
 | 3 | Realtime: `Listen`/`Write` streams for the native mobile SDKs |
 | 4 | Security rules interpreter (`firestore.rules` verbatim) + Firebase Auth token verification |
 | 5 | WebChannel transport (browser `firebase-js` support) |
@@ -175,8 +182,10 @@ once. A backup nobody has restored is not a backup.
 - **Composite indexes as rows**, maintained transactionally in an
   `index_entries` table — the way Firestore itself works — giving a
   deterministic query planner instead of praying to PostgreSQL's.
-- **A low-water-marked change-log** (single sequencer) will power realtime
-  listeners, triggers, and migration mirrors without dropped events.
+- **A low-water-marked change-log** (single sequencer) feeds triggers and
+  search indexers without dropped events, and will power realtime listeners.
+  Collections that have triggers also record before/after document images,
+  written in the same transaction as the write.
 
 ## Development
 
@@ -186,7 +195,10 @@ go test ./...        # needs initdb/pg_ctl on PATH; spins a throwaway cluster
 ```
 
 The e2e suite (`e2e/`) runs the official `cloud.google.com/go/firestore`
-client against a full in-process Kor server.
+client against a full in-process Kor server. The functions runtime has its own
+unit tests (`cd functions && npm test`) and an end-to-end suite that drives
+real `firebase-functions` code through two kords
+(`functions/test/e2e/run.sh`).
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the compatibility-testing
 philosophy and PR guidelines, and [SECURITY.md](SECURITY.md) for how to report

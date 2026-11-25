@@ -1,0 +1,21 @@
+const { Firestore } = require('@google-cloud/firestore');
+const db = new Firestore({ projectId: 'demo-p', host: '127.0.0.1', port: Number(process.env.KOR_GRPC.split(':')[1]), ssl: false });
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+(async () => {
+  const p = db.collection('posts').doc('p1');
+  await p.set({ v: 1 });
+  await sleep(1500);
+  await p.update({ v: 2 });
+  await sleep(1500);
+  await p.delete();
+  await sleep(2500);
+  const audit = await db.collection('audit').get();
+  const got = Object.fromEntries(audit.docs.map((d) => [d.id, d.data()]));
+  const assert = require('node:assert');
+  assert.deepStrictEqual(got, { 'c-p1': { v: 1, exists: true }, 'u-p1': { before: 1, after: 2 }, 'd-p1': { v: 2 } });
+  assert.strictEqual((await db.collection('counters').doc('updates').get()).data().n, 1);
+  assert.strictEqual((await db.collection('counters').doc('writes').get()).data().n, 3);
+  assert.ok((await db.collection('ticks').get()).size >= 1, 'the every-minute schedule fired at startup');
+  console.log('OK triggers + schedule');
+  process.exit(0);
+})().catch((e) => { console.error('FAIL', e); process.exit(1); });

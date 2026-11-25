@@ -19,6 +19,7 @@ import (
 
 	"google.golang.org/grpc"
 
+	"github.com/omelas-tech/kor/internal/feed"
 	"github.com/omelas-tech/kor/internal/rpc"
 	"github.com/omelas-tech/kor/internal/store"
 )
@@ -104,6 +105,10 @@ func main() {
 				if _, err := st.LoadIndexes(ctx); err != nil {
 					log.Warn("reloading composite indexes", "err", err)
 				}
+				// Picks up feed-image registrations made by the CLI.
+				if _, err := st.LoadFeedImages(ctx); err != nil {
+					log.Warn("reloading feed image collections", "err", err)
+				}
 			}
 		}
 	}()
@@ -121,9 +126,10 @@ func main() {
 	rpc.New(st).Register(g)
 	rpc.StartStatsReporter(ctx, log, time.Minute)
 	if *metricsAddr != "" {
-		metricsSrv := rpc.ServeMetrics(*metricsAddr)
+		metricsSrv := rpc.ServeMetrics(*metricsAddr, feed.Handler(st, log))
 		defer metricsSrv.Close()
-		log.Info("metrics listening", "addr", *metricsAddr)
+		log.Info("metrics + change-feed API listening", "addr", *metricsAddr,
+			"feed_images", st.FeedImageCollections())
 	}
 
 	go func() {

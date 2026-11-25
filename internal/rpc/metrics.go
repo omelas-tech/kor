@@ -17,12 +17,15 @@ var rpcDuration = promauto.NewHistogramVec(
 	[]string{"method", "code"},
 )
 
-// ServeMetrics exposes Prometheus metrics on addr (bind loopback only).
-// Returns the server so callers can Close it; errors are returned via the
-// channel-free convention of http.Server (caller logs ListenAndServe result).
-func ServeMetrics(addr string) *http.Server {
+// ServeMetrics exposes Prometheus metrics on addr (bind loopback only), plus
+// any extra handlers (the change-feed API) on the same admin listener.
+// Returns the server so callers can Close it.
+func ServeMetrics(addr string, extra ...http.Handler) *http.Server {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
+	for _, h := range extra {
+		mux.Handle("/feed/", h)
+	}
 	srv := &http.Server{Addr: addr, Handler: mux}
 	go func() { _ = srv.ListenAndServe() }()
 	return srv

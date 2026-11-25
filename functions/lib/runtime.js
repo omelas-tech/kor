@@ -10,6 +10,7 @@
 // the same of them.
 
 const fs = require('node:fs');
+const http = require('node:http');
 const path = require('node:path');
 const { compile, match, collectionOf } = require('./pattern');
 const cron = require('./cron');
@@ -220,15 +221,37 @@ class Runtime {
     }
   }
 
-  async http(method, p, body) {
-    const res = await fetch(this.o.feedUrl.replace(/\/$/, '') + p, {
-      method,
-      headers: body ? { 'content-type': 'application/json' } : undefined,
-      body: body ? JSON.stringify(body) : undefined,
+  /**
+   * node:http, not fetch: the fetch spec blocks a list of "bad ports", and
+   * kord's default admin port (6566, the SANE scanner port) is on it.
+   */
+  http(method, p, body) {
+    const url = new URL(this.o.feedUrl.replace(/\/$/, '') + p);
+    const payload = body ? JSON.stringify(body) : undefined;
+    return new Promise((resolve, reject) => {
+      const req = http.request(url, {
+        method,
+        headers: payload ? { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) } : {},
+        timeout: 60000,
+      }, (res) => {
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => {
+          let json = {};
+          try {
+            json = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+          } catch {
+            // fall through with an empty object; the status decides
+          }
+          if (res.statusCode >= 400) reject(new Error(`${method} ${p}: HTTP ${res.statusCode} ${json.error || ''}`));
+          else resolve(json);
+        });
+        res.on('error', reject);
+      });
+      req.on('timeout', () => req.destroy(new Error(`${method} ${p}: timed out`)));
+      req.on('error', reject);
+      req.end(payload);
     });
-    const json = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(`${method} ${p}: HTTP ${res.status} ${json.error || ''}`);
-    return json;
   }
 
   sleep(ms) {

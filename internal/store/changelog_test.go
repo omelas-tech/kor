@@ -60,7 +60,7 @@ func TestChangelogHidesEventsUntilOlderTransactionsFinish(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := appendChange(ctx, tx, idxParent+"/posts/old", "posts", "write"); err != nil {
+	if err := appendChange(ctx, tx, idxParent+"/posts/old", "posts", "write", nil); err != nil {
 		t.Fatal(err)
 	}
 

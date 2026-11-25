@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/omelas-tech/kor/internal/value"
 	"github.com/omelas-tech/kor/internal/writes"
@@ -38,6 +39,9 @@ type Store struct {
 	// indexedContains counts index-served queries whose definition fans a
 	// document out per array element.
 	indexedContains atomic.Int64
+	// feedImages is the set of collections whose change-feed rows carry
+	// before/after documents (see RegisterFeedImages). nil = none.
+	feedImages atomic.Pointer[map[string]bool]
 }
 
 // Doc is a stored document.
@@ -60,6 +64,10 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 	}
 	s := &Store{Pool: pool}
 	if err := s.migrate(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	if _, err := s.LoadFeedImages(ctx); err != nil {
 		pool.Close()
 		return nil, err
 	}
@@ -276,6 +284,29 @@ func (s *Store) applyCommit(ctx context.Context, ws []*pb.Write, extraLocks []st
 		}
 	}
 
+	// Before-images for collections that capture them, taken before any write
+	// applies: writes.Apply mutates the state in place.
+	befores := map[string]*pb.Document{}
+	for _, name := range targets {
+		if !s.capturesImages(paths[name].CollectionID) {
+			continue
+		}
+		if doc, ok := existing[name]; ok {
+			// Clone: the write state below shares doc.Fields, and Apply may
+			// mutate it in place — which would turn this into the after-image.
+			befores[name] = proto.Clone(imageOf(name, true, doc.Fields, doc.CreateTime, doc.UpdateTime)).(*pb.Document)
+		}
+	}
+	imagesFor := func(name string, st *writes.DocState) *changeImages {
+		if !s.capturesImages(paths[name].CollectionID) {
+			return nil
+		}
+		return &changeImages{
+			before: befores[name],
+			after:  imageOf(name, st.Exists, st.Fields, st.CreateTime, st.UpdateTime),
+		}
+	}
+
 	results := make([]*pb.WriteResult, 0, len(ws))
 	for _, w := range ws {
 		name, _ := writes.TargetName(w)
@@ -312,7 +343,7 @@ func (s *Store) applyCommit(ctx context.Context, ws []*pb.Write, extraLocks []st
 			if err := s.refreshIndexEntries(ctx, tx, name, p.CollectionID, st.Fields, false); err != nil {
 				return nil, time.Time{}, err
 			}
-			if err := appendChange(ctx, tx, name, p.CollectionID, "write"); err != nil {
+			if err := appendChange(ctx, tx, name, p.CollectionID, "write", imagesFor(name, st)); err != nil {
 				return nil, time.Time{}, err
 			}
 		} else {
@@ -322,7 +353,7 @@ func (s *Store) applyCommit(ctx context.Context, ws []*pb.Write, extraLocks []st
 			if err := s.refreshIndexEntries(ctx, tx, name, paths[name].CollectionID, nil, true); err != nil {
 				return nil, time.Time{}, err
 			}
-			if err := appendChange(ctx, tx, name, paths[name].CollectionID, "delete"); err != nil {
+			if err := appendChange(ctx, tx, name, paths[name].CollectionID, "delete", imagesFor(name, st)); err != nil {
 				return nil, time.Time{}, err
 			}
 		}

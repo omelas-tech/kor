@@ -47,6 +47,29 @@ jobs:
         env:
           FIREBASE_NODE_MODULES: ${{ runner.temp }}/fb/node_modules
 
+  # Realtime through a real client SDK: firebase-js under Node uses the same
+  # gRPC Listen/Write streams as the native mobile SDKs.
+  client-sdk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Put PostgreSQL binaries on PATH
+        run: echo "$(ls -d /usr/lib/postgresql/*/bin | head -1)" >> "$GITHUB_PATH"
+      - name: Install the firebase-js SDK
+        run: |
+          mkdir -p "$RUNNER_TEMP/fbjs" && cd "$RUNNER_TEMP/fbjs"
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund firebase@^12
+      - run: e2e/js/run.sh
+        env:
+          FIREBASE_NODE_MODULES: ${{ runner.temp }}/fbjs/node_modules
+
   # G2: differential fuzz against Google's own Firestore emulator.
   #
   # Separate from the unit job because it needs Java and a downloaded emulator,
@@ -87,4 +110,4 @@ jobs:
           KOR_FUZZ_EMULATOR: 127.0.0.1:8080
           KOR_FUZZ_SEED: ${{ github.run_number }}
           KOR_REQUIRE_PG: "1"
-        run: go test ./e2e/ -run TestFuzzAgainstFirestoreEmulator -count=1 -v
+        run: go test ./e2e/ -run 'TestFuzzAgainstFirestoreEmulator|TestListenDifferential' -count=1 -v

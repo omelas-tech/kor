@@ -23,11 +23,12 @@ import (
 type Server struct {
 	pb.UnimplementedFirestoreServer
 	store *store.Store
+	hub   *hub
 }
 
 // New returns a Firestore service backed by st.
 func New(st *store.Store) *Server {
-	return &Server{store: st}
+	return &Server{store: st, hub: newHub(st, nil)}
 }
 
 // Register attaches the service to a gRPC server.

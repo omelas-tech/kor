@@ -69,6 +69,11 @@ production application's full API test suite passing against Kor unchanged):
   (`startAt/After`, `endAt/Before`, snapshot cursors), offset/limit,
   projections and keys-only, collection-group queries
 - **`count()` aggregations** (with `up_to`)
+- **Realtime** (`Listen`, `Write` streams): `onSnapshot` / `Snapshots()` on
+  queries (including limit windows and collection groups) and documents,
+  many targets per stream, and the streaming writes the native mobile SDKs
+  use. Checked against Google's emulator by a differential test and driven
+  by the real firebase-js SDK in CI — see [docs/realtime.md](docs/realtime.md)
 - **Optimistic transactions**: `BeginTransaction`/`Commit`/`Rollback` with
   read-version verification at commit under row + advisory locks — exact
   under contention, including concurrent create-if-absent races; conflicts
@@ -127,7 +132,7 @@ On the roadmap (in build order):
 |---|---|
 | 1 | ~~Composite `index_entries` execution~~, ~~differential fuzzing vs the Google emulator~~ — both shipped |
 | 2 | ~~Change-log~~, ~~functions runtime (runs `firebase-functions` v2 code unchanged)~~, ~~cron scheduler~~ — shipped, see [docs/functions.md](docs/functions.md) |
-| 3 | Realtime: `Listen`/`Write` streams for the native mobile SDKs |
+| 3 | ~~Realtime: `Listen`/`Write` streams for the native mobile SDKs~~ — shipped, see [docs/realtime.md](docs/realtime.md) |
 | 4 | Security rules interpreter (`firestore.rules` verbatim) + Firebase Auth token verification |
 | 5 | WebChannel transport (browser `firebase-js` support) |
 | 6 | Migration tooling: ~~streaming importer~~, ~~verifier~~, ~~reverse export~~ (all shipped, see [docs/cli.md](docs/cli.md)); bidirectional mirror remains |
@@ -183,7 +188,7 @@ once. A backup nobody has restored is not a backup.
   `index_entries` table — the way Firestore itself works — giving a
   deterministic query planner instead of praying to PostgreSQL's.
 - **A low-water-marked change-log** (single sequencer) feeds triggers and
-  search indexers without dropped events, and will power realtime listeners.
+  search indexers without dropped events, and powers realtime listeners.
   Collections that have triggers also record before/after document images,
   written in the same transaction as the write.
 

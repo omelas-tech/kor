@@ -111,8 +111,9 @@ to the store that owns it:
 - Outside a transaction, a `getAll` or a write batch that spans both stores
   is split into two RPCs and the results are merged in request order. That
   write is **not atomic across stores**, and it is logged each time.
-- `onSnapshot` listeners always go to Google, because Kor has no `Listen` yet
-  (roadmap phase 3).
+- `onSnapshot` listeners in function code always go to Google: kord serves
+  `Listen` since phase 3 ([realtime.md](realtime.md)), but the hybrid router
+  does not route watch streams yet.
 
 The router patches the two internal funnels every SDK call goes through
 (`Firestore#request` and `#requestStream`), so it covers the whole API

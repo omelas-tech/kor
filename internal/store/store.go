@@ -198,13 +198,69 @@ func scanDocs(rows pgx.Rows) (map[string]*Doc, error) {
 // observe the effects of earlier ones (required by SDKs that pair an update
 // with a separate transform write for the same document).
 func (s *Store) Commit(ctx context.Context, ws []*pb.Write) ([]*pb.WriteResult, time.Time, error) {
-	return s.applyCommit(ctx, ws, nil, nil)
+	return s.applyCommit(ctx, ws, nil, nil, nil)
+}
+
+// CommitGuarded is Commit with a guard that may veto the batch (security
+// rules). The guard runs inside the commit's transaction, after the writes
+// are applied in memory and before anything persists.
+func (s *Store) CommitGuarded(ctx context.Context, ws []*pb.Write, guard Guard) ([]*pb.WriteResult, time.Time, error) {
+	return s.applyCommit(ctx, ws, nil, nil, guard)
+}
+
+// GuardDoc is one document a commit touches. Before and After are nil when
+// the document does not exist on that side of the commit.
+type GuardDoc struct {
+	Name          string
+	Before, After *Doc
+}
+
+// GuardReader reads other documents for a guard: Get as committed before
+// this batch, GetAfter as the batch would leave them. Both run inside the
+// commit's transaction. nil means the document does not exist.
+type GuardReader interface {
+	Get(ctx context.Context, name string) (*Doc, error)
+	GetAfter(ctx context.Context, name string) (*Doc, error)
+}
+
+// Guard decides a commit; a non-nil error aborts it and is returned as is.
+type Guard func(ctx context.Context, commitTime time.Time, docs []GuardDoc, r GuardReader) error
+
+type guardReader struct {
+	tx     pgx.Tx
+	states map[string]*writes.DocState
+}
+
+func (g *guardReader) Get(ctx context.Context, name string) (*Doc, error) {
+	rows, err := g.tx.Query(ctx, `SELECT name, data, create_time, update_time FROM documents WHERE name = $1`, name)
+	if err != nil {
+		return nil, fmt.Errorf("store: guard read %s: %w", name, err)
+	}
+	docs, err := scanDocs(rows)
+	if err != nil {
+		return nil, err
+	}
+	return docs[name], nil
+}
+
+func (g *guardReader) GetAfter(ctx context.Context, name string) (*Doc, error) {
+	if st, ok := g.states[name]; ok {
+		return stateDoc(st), nil
+	}
+	return g.Get(ctx, name)
+}
+
+func stateDoc(st *writes.DocState) *Doc {
+	if !st.Exists {
+		return nil
+	}
+	return &Doc{Name: st.Name, Fields: st.Fields, CreateTime: st.CreateTime, UpdateTime: st.UpdateTime}
 }
 
 // applyCommit is the shared core of Commit and CommitTxn: lock the union of
 // write targets and extraLocks in canonical order, verify recorded read
 // versions (ABORTED on drift), apply writes, persist.
-func (s *Store) applyCommit(ctx context.Context, ws []*pb.Write, extraLocks []string, verify map[string]time.Time) ([]*pb.WriteResult, time.Time, error) {
+func (s *Store) applyCommit(ctx context.Context, ws []*pb.Write, extraLocks []string, verify map[string]time.Time, guard Guard) ([]*pb.WriteResult, time.Time, error) {
 	commitTime := time.Now().UTC().Truncate(time.Microsecond)
 
 	// Collect and lock target documents in canonical order (deadlock safety).
@@ -307,6 +363,18 @@ func (s *Store) applyCommit(ctx context.Context, ws []*pb.Write, extraLocks []st
 		}
 	}
 
+	// The guard's before-state, deep-copied for the same reason as the images.
+	var guardBefore map[string]*Doc
+	if guard != nil {
+		guardBefore = make(map[string]*Doc, len(targets))
+		for _, name := range targets {
+			if doc, ok := existing[name]; ok {
+				img := proto.Clone(imageOf(name, true, doc.Fields, doc.CreateTime, doc.UpdateTime)).(*pb.Document)
+				guardBefore[name] = &Doc{Name: name, Fields: img.GetFields(), CreateTime: doc.CreateTime, UpdateTime: doc.UpdateTime}
+			}
+		}
+	}
+
 	results := make([]*pb.WriteResult, 0, len(ws))
 	for _, w := range ws {
 		name, _ := writes.TargetName(w)
@@ -315,6 +383,16 @@ func (s *Store) applyCommit(ctx context.Context, ws []*pb.Write, extraLocks []st
 			return nil, time.Time{}, err
 		}
 		results = append(results, res)
+	}
+
+	if guard != nil {
+		gds := make([]GuardDoc, 0, len(targets))
+		for _, name := range targets {
+			gds = append(gds, GuardDoc{Name: name, Before: guardBefore[name], After: stateDoc(states[name])})
+		}
+		if err := guard(ctx, commitTime, gds, &guardReader{tx: tx, states: states}); err != nil {
+			return nil, time.Time{}, err
+		}
 	}
 
 	for _, name := range targets {

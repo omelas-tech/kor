@@ -16,6 +16,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/omelas-tech/kor/internal/query"
+	"github.com/omelas-tech/kor/internal/rules"
 	"github.com/omelas-tech/kor/internal/store"
 )
 
@@ -24,6 +25,19 @@ type Server struct {
 	pb.UnimplementedFirestoreServer
 	store *store.Store
 	hub   *hub
+	sec   *security // nil on the trusted endpoint
+}
+
+// writeGuard returns the commit guard for the caller (nil when trusted).
+func (s *Server) writeGuard(ctx context.Context) (store.Guard, error) {
+	if s.sec == nil {
+		return nil, nil
+	}
+	a, _, err := s.sec.identity(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return s.sec.guard(a), nil
 }
 
 // New returns a Firestore service backed by st.
@@ -44,10 +58,14 @@ func (s *Server) Commit(ctx context.Context, req *pb.CommitRequest) (*pb.CommitR
 		commitTime time.Time
 		err        error
 	)
+	guard, err := s.writeGuard(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if txn := req.GetTransaction(); len(txn) > 0 {
-		results, commitTime, err = s.store.CommitTxn(ctx, txn, req.GetWrites())
+		results, commitTime, err = s.store.CommitTxnGuarded(ctx, txn, req.GetWrites(), guard)
 	} else {
-		results, commitTime, err = s.store.Commit(ctx, req.GetWrites())
+		results, commitTime, err = s.store.CommitGuarded(ctx, req.GetWrites(), guard)
 	}
 	if err != nil {
 		return nil, err
@@ -60,6 +78,11 @@ func (s *Server) Commit(ctx context.Context, req *pb.CommitRequest) (*pb.CommitR
 
 // BeginTransaction starts an optimistic transaction.
 func (s *Server) BeginTransaction(ctx context.Context, req *pb.BeginTransactionRequest) (*pb.BeginTransactionResponse, error) {
+	if s.sec != nil {
+		if _, _, err := s.sec.identity(ctx); err != nil {
+			return nil, err
+		}
+	}
 	return &pb.BeginTransactionResponse{Transaction: s.store.BeginTxn()}, nil
 }
 
@@ -74,6 +97,9 @@ func (s *Server) RunQuery(req *pb.RunQueryRequest, stream pb.Firestore_RunQueryS
 	if req.GetTransaction() != nil || req.GetNewTransaction() != nil || req.GetReadTime() != nil {
 		// Point-read transactions only, by design — see internal/store/txn.go.
 		return status.Error(codes.Unimplemented, "kor: queries inside transactions are not supported")
+	}
+	if s.sec != nil {
+		return s.runQuerySecured(req, stream)
 	}
 	q, err := query.Parse(req.GetParent(), req.GetStructuredQuery())
 	if err != nil {
@@ -107,7 +133,13 @@ func (s *Server) RunAggregationQuery(req *pb.RunAggregationQueryRequest, stream 
 		return status.Error(codes.Unimplemented, "kor: aggregations inside transactions are not supported")
 	}
 	saq := req.GetStructuredAggregationQuery()
-	q, err := query.Parse(req.GetParent(), saq.GetStructuredQuery())
+	var q *query.Query
+	var err error
+	if s.sec != nil {
+		_, q, err = s.authorizeQuery(stream.Context(), req.GetParent(), saq.GetStructuredQuery())
+	} else {
+		q, err = query.Parse(req.GetParent(), saq.GetStructuredQuery())
+	}
 	if err != nil {
 		return err
 	}
@@ -143,6 +175,10 @@ func (s *Server) RunAggregationQuery(req *pb.RunAggregationQueryRequest, stream 
 // This is what BulkWriter uses; partial failure is expected and reported
 // per-entry rather than failing the RPC.
 func (s *Server) BatchWrite(ctx context.Context, req *pb.BatchWriteRequest) (*pb.BatchWriteResponse, error) {
+	if s.sec != nil {
+		// BulkWriter is a server-SDK API; no client SDK sends BatchWrite.
+		return nil, errDenied
+	}
 	resp := &pb.BatchWriteResponse{}
 	for _, w := range req.GetWrites() {
 		results, _, err := s.store.Commit(ctx, []*pb.Write{w})
@@ -163,11 +199,24 @@ func (s *Server) GetDocument(ctx context.Context, req *pb.GetDocumentRequest) (*
 	if req.GetReadTime() != nil {
 		return nil, status.Error(codes.Unimplemented, "kor: read-time reads not implemented yet")
 	}
+	var caller map[string]any
+	if s.sec != nil {
+		var err error
+		if caller, _, err = s.sec.identity(ctx); err != nil {
+			return nil, err
+		}
+		if err := s.sec.checkName(req.GetName()); err != nil {
+			return nil, err
+		}
+	}
 	docs, err := s.store.GetDocuments(ctx, []string{req.GetName()})
 	if err != nil {
 		return nil, err
 	}
 	doc, ok := docs[req.GetName()]
+	if s.sec != nil && !s.sec.canGet(ctx, s.store, caller, req.GetName(), doc, rules.NewBudget(10)) {
+		return nil, errDenied
+	}
 	if txn := req.GetTransaction(); len(txn) > 0 {
 		var readAt time.Time // zero records "missing at read time"
 		if ok {
@@ -196,9 +245,35 @@ func (s *Server) BatchGetDocuments(req *pb.BatchGetDocumentsRequest, stream pb.F
 		txnID = newTxn
 	}
 
+	var caller map[string]any
+	if s.sec != nil {
+		var err error
+		if caller, _, err = s.sec.identity(stream.Context()); err != nil {
+			return err
+		}
+		for _, name := range req.GetDocuments() {
+			if err := s.sec.checkName(name); err != nil {
+				return err
+			}
+		}
+	}
 	docs, err := s.store.GetDocuments(stream.Context(), req.GetDocuments())
 	if err != nil {
 		return err
+	}
+	if s.sec != nil {
+		// Decide every document before answering any: a partly answered
+		// getAll would leak the documents ahead of the first denial.
+		limit := 10
+		if len(req.GetDocuments()) > 1 {
+			limit = 20
+		}
+		b := rules.NewBudget(limit)
+		for _, name := range req.GetDocuments() {
+			if !s.sec.canGet(stream.Context(), s.store, caller, name, docs[name], b) {
+				return errDenied
+			}
+		}
 	}
 
 	if len(txnID) > 0 {
@@ -242,6 +317,9 @@ func (s *Server) BatchGetDocuments(req *pb.BatchGetDocumentsRequest, stream pb.F
 // ListCollectionIds lists the collection ids under a parent, from the
 // registry maintained on write.
 func (s *Server) ListCollectionIds(ctx context.Context, req *pb.ListCollectionIdsRequest) (*pb.ListCollectionIdsResponse, error) {
+	if s.sec != nil {
+		return nil, errDenied // admin-only in Firestore too
+	}
 	rows, err := s.store.Pool.Query(ctx,
 		`SELECT collection_id FROM collections WHERE parent_path = $1 ORDER BY collection_id`, req.GetParent())
 	if err != nil {
@@ -278,4 +356,42 @@ func statusProto(err error) *rpcstatus.Status {
 	}
 	st, _ := status.FromError(err)
 	return st.Proto()
+}
+
+// runQuerySecured answers a query on the client endpoint: decided before it
+// runs, and every result re-checked before any is sent.
+func (s *Server) runQuerySecured(req *pb.RunQueryRequest, stream pb.Firestore_RunQueryServer) error {
+	ctx := stream.Context()
+	caller, q, err := s.authorizeQuery(ctx, req.GetParent(), req.GetStructuredQuery())
+	if err != nil {
+		return err
+	}
+	var docs []*store.Doc
+	if err := s.store.RunQuery(ctx, q, func(doc *store.Doc) error {
+		docs = append(docs, doc)
+		return nil
+	}); err != nil {
+		return err
+	}
+	for _, d := range docs {
+		if !s.sec.canListDoc(ctx, s.store, caller, q, d) {
+			s.sec.log.Warn("rules: query passed but a result failed its concrete check", "parent", req.GetParent(), "doc", d.Name)
+			return errDenied
+		}
+	}
+	readTime := timestamppb.New(time.Now().UTC().Truncate(time.Microsecond))
+	for _, doc := range docs {
+		d, err := docProto(doc)
+		if err != nil {
+			return err
+		}
+		d.Fields = q.ApplyProjection(d.Fields)
+		if err := stream.Send(&pb.RunQueryResponse{Document: d, ReadTime: readTime}); err != nil {
+			return err
+		}
+	}
+	if len(docs) == 0 {
+		return stream.Send(&pb.RunQueryResponse{ReadTime: readTime})
+	}
+	return nil
 }

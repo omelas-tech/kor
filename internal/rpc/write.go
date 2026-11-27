@@ -24,6 +24,14 @@ import (
 // (the SDK's way of acking a token) is answered with a new token alone.
 func (s *Server) Write(stream pb.Firestore_WriteServer) error {
 	ctx := stream.Context()
+	guard, err := s.writeGuard(ctx)
+	if err != nil {
+		return err
+	}
+	var expires time.Time
+	if s.sec != nil {
+		_, expires, _ = s.sec.identity(ctx)
+	}
 	first, err := stream.Recv()
 	if err != nil {
 		if errors.Is(err, io.EOF) {
@@ -53,8 +61,11 @@ func (s *Server) Write(stream pb.Firestore_WriteServer) error {
 			return err
 		}
 		resp := &pb.WriteResponse{StreamId: id}
+		if !expires.IsZero() && time.Now().After(expires) {
+			return status.Error(codes.Unauthenticated, "ID token expired; reconnect with a fresh one")
+		}
 		if ws := req.GetWrites(); len(ws) > 0 {
-			results, commitTime, err := s.store.Commit(ctx, ws)
+			results, commitTime, err := s.store.CommitGuarded(ctx, ws, guard)
 			if err != nil {
 				// The stream dies with the batch's error, as Firestore's does:
 				// the SDK rejects that batch and reopens for the next.

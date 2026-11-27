@@ -98,6 +98,11 @@ func (s *Store) RollbackTxn(id []byte) { s.txns.drop(id) }
 // CommitTxn atomically verifies the transaction's reads and applies writes.
 // Version drift returns ABORTED, which Firestore SDKs retry automatically.
 func (s *Store) CommitTxn(ctx context.Context, id []byte, ws []*pb.Write) ([]*pb.WriteResult, time.Time, error) {
+	return s.CommitTxnGuarded(ctx, id, ws, nil)
+}
+
+// CommitTxnGuarded is CommitTxn with a guard (see CommitGuarded).
+func (s *Store) CommitTxnGuarded(ctx context.Context, id []byte, ws []*pb.Write, guard Guard) ([]*pb.WriteResult, time.Time, error) {
 	e, err := s.txns.take(id)
 	if err != nil {
 		return nil, time.Time{}, err
@@ -106,5 +111,5 @@ func (s *Store) CommitTxn(ctx context.Context, id []byte, ws []*pb.Write) ([]*pb
 	for name := range e.reads {
 		extraLocks = append(extraLocks, name)
 	}
-	return s.applyCommit(ctx, ws, extraLocks, e.reads)
+	return s.applyCommit(ctx, ws, extraLocks, e.reads, guard)
 }

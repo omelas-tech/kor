@@ -110,4 +110,4 @@ jobs:
           KOR_FUZZ_EMULATOR: 127.0.0.1:8080
           KOR_FUZZ_SEED: ${{ github.run_number }}
           KOR_REQUIRE_PG: "1"
-        run: go test ./e2e/ -run 'TestFuzzAgainstFirestoreEmulator|TestListenDifferential' -count=1 -v
+        run: go test ./e2e/ -run 'TestFuzzAgainstFirestoreEmulator|TestListenDifferential|TestRulesDifferential' -count=1 -v

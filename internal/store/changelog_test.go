@@ -17,7 +17,7 @@ func TestChangelogRecordsWritesAndDeletes(t *testing.T) {
 	setDoc(t, s, idxParent+"/posts/b", map[string]*pb.Value{"v": ival(2)})
 	if _, _, err := s.applyCommit(ctx, []*pb.Write{
 		{Operation: &pb.Write_Delete{Delete: idxParent + "/posts/a"}},
-	}, nil, nil); err != nil {
+	}, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 

@@ -18,9 +18,13 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/keepalive"
 
+	"github.com/omelas-tech/kor/internal/auth"
 	"github.com/omelas-tech/kor/internal/feed"
 	"github.com/omelas-tech/kor/internal/rpc"
+	"github.com/omelas-tech/kor/internal/rules"
 	"github.com/omelas-tech/kor/internal/store"
 )
 
@@ -36,6 +40,14 @@ func main() {
 	metricsAddr := flag.String("metrics", envOr("KORD_METRICS", "127.0.0.1:6566"), "Prometheus /metrics address (empty = disabled)")
 	allowPublic := flag.Bool("i-know-this-is-unauthenticated", envOr("KORD_ALLOW_PUBLIC_BIND", "") != "",
 		"permit binding a non-loopback address. kord has NO authentication: any client that can reach the port has full read/write on every document.")
+	clientListen := flag.String("client-listen", os.Getenv("KORD_CLIENT_LISTEN"),
+		"address for the client endpoint (Firebase client SDKs): every request authenticated by ID token and decided by -rules. Empty = disabled")
+	rulesFile := flag.String("rules", os.Getenv("KORD_RULES"), "firestore.rules file the client endpoint enforces (reloaded when it changes)")
+	project := flag.String("project", os.Getenv("KORD_PROJECT"), "Firebase project id whose ID tokens the client endpoint accepts")
+	tlsCert := flag.String("client-tls-cert", os.Getenv("KORD_CLIENT_TLS_CERT"), "TLS certificate for the client endpoint")
+	tlsKey := flag.String("client-tls-key", os.Getenv("KORD_CLIENT_TLS_KEY"), "TLS key for the client endpoint")
+	unsigned := flag.Bool("accept-unsigned-test-tokens", false,
+		"TESTS ONLY: accept unsigned (alg none) ID tokens, as the Firebase emulators issue. Anyone can then act as any user. Requires a loopback -client-listen")
 	flag.Parse()
 
 	var level slog.Level
@@ -123,7 +135,17 @@ func main() {
 		grpc.UnaryInterceptor(rpc.UnaryLogging(log)),
 		grpc.StreamInterceptor(rpc.StreamLogging(log)),
 	)
-	rpc.New(st).Register(g)
+	trusted := rpc.New(st)
+	trusted.Register(g)
+
+	if *clientListen != "" {
+		stopClient, err := serveClient(ctx, log, trusted, *clientListen, *rulesFile, *project, *tlsCert, *tlsKey, *unsigned)
+		if err != nil {
+			log.Error("refusing to start the client endpoint", "err", err)
+			os.Exit(2)
+		}
+		defer stopClient()
+	}
 	rpc.StartStatsReporter(ctx, log, time.Minute)
 	if *metricsAddr != "" {
 		metricsSrv := rpc.ServeMetrics(*metricsAddr, feed.Handler(st, log))
@@ -191,4 +213,100 @@ func isLoopbackHost(host string) bool {
 		}
 	}
 	return true
+}
+
+// serveClient starts the authenticated client endpoint on its own listener.
+// It shares the store and change hub with the trusted endpoint but is a
+// separate gRPC server, so nothing reachable on it bypasses the rules.
+func serveClient(ctx context.Context, log *slog.Logger, trusted *rpc.Server, addr, rulesFile, project, cert, key string, unsigned bool) (func(), error) {
+	if rulesFile == "" || project == "" {
+		return nil, fmt.Errorf("-client-listen needs -rules and -project")
+	}
+	loopback := requireLoopback(addr) == nil
+	if unsigned && !loopback {
+		return nil, fmt.Errorf("-accept-unsigned-test-tokens on non-loopback %s would let anyone act as any user", addr)
+	}
+	if !loopback && (cert == "" || key == "") {
+		// ID tokens are bearer credentials: in clear text they are stolen.
+		return nil, fmt.Errorf("client endpoint %s is off-host: give -client-tls-cert/-client-tls-key or terminate TLS in front of a loopback bind", addr)
+	}
+	rs, mtime, err := loadRules(rulesFile)
+	if err != nil {
+		return nil, err
+	}
+	var opts []auth.Option
+	if unsigned {
+		opts = append(opts, auth.AcceptUnsignedTokens())
+		log.Warn("CLIENT ENDPOINT ACCEPTS UNSIGNED TOKENS — any caller can claim any identity (tests only)")
+	}
+	client := rpc.NewClient(trusted, rs, auth.New(project, nil, opts...), project, log)
+
+	sopts := []grpc.ServerOption{
+		grpc.UnaryInterceptor(rpc.UnaryLogging(log)),
+		grpc.StreamInterceptor(rpc.StreamLogging(log)),
+		// Mobile clients hold streams open for hours behind NATs.
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{MinTime: 10 * time.Second, PermitWithoutStream: true}),
+	}
+	if cert != "" {
+		creds, err := credentials.NewServerTLSFromFile(cert, key)
+		if err != nil {
+			return nil, fmt.Errorf("client TLS: %w", err)
+		}
+		sopts = append(sopts, grpc.Creds(creds))
+	}
+	g := grpc.NewServer(sopts...)
+	client.Register(g)
+	lis, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	go func() {
+		if err := g.Serve(lis); err != nil {
+			log.Error("client endpoint", "err", err)
+		}
+	}()
+	go func() {
+		t := time.NewTicker(5 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				fi, err := os.Stat(rulesFile)
+				if err != nil || fi.ModTime().Equal(mtime) {
+					continue
+				}
+				next, m, err := loadRules(rulesFile)
+				if err != nil {
+					// Keep enforcing the last good ruleset; a typo must not open
+					// or close the whole database.
+					log.Error("rules reload failed; keeping the previous ruleset", "file", rulesFile, "err", err)
+					mtime = fi.ModTime()
+					continue
+				}
+				client.SetRules(next)
+				mtime = m
+				log.Info("rules reloaded", "file", rulesFile)
+			}
+		}
+	}()
+	log.Info("client endpoint serving", "addr", lis.Addr().String(), "project", project, "rules", rulesFile, "tls", cert != "")
+	return g.GracefulStop, nil
+}
+
+func loadRules(path string) (*rules.Ruleset, time.Time, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	src, err := os.ReadFile(path)
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	rs, err := rules.Parse(string(src))
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	return rs, fi.ModTime(), nil
 }

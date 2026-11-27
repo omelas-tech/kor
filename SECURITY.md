@@ -15,9 +15,19 @@ reproduction and the deployment shape (kord version, how it is exposed).
 
 ## Deployment expectations
 
-kord binds to `127.0.0.1` by default and currently performs **no
-authentication or authorization** — it trusts every connection, like the
-Firestore emulator does. Reachability is therefore authorization: any client
+kord has two endpoints.
+
+The **client endpoint** (`-client-listen`, off by default) is the one meant
+for untrusted callers: every request must carry a valid Firebase ID token (or
+none, for signed-out access) and is decided by the security rules given with
+`-rules`. A bug that lets a client endpoint read or write anything its rules
+deny is a vulnerability — please report it. See
+[docs/security.md](docs/security.md).
+
+The **main endpoint** (`-listen`) binds to `127.0.0.1` by default and
+performs **no authentication or authorization** — it is the trusted, admin
+endpoint, like Firestore's service-account access, and trusts every
+connection. Reachability is therefore authorization: any client
 that can open a TCP connection has full read/write on every document, with no
 identity and no per-collection rules.
 
@@ -38,5 +48,5 @@ regardless — defence against a future config edit, not against today's one.
 
 Do not expose kord to untrusted networks; put it on loopback, a private
 network, or behind an authenticating proxy. Reports that
-amount to "an exposed kord accepts writes" are working as documented (for
-now — auth and security rules are on the roadmap).
+amount to "an exposed main endpoint accepts writes" are working as
+documented; serve apps from the client endpoint instead.

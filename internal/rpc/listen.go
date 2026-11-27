@@ -14,6 +14,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/omelas-tech/kor/internal/query"
+	"github.com/omelas-tech/kor/internal/rules"
 	"github.com/omelas-tech/kor/internal/store"
 )
 
@@ -33,6 +34,22 @@ import (
 // would have to know which documents left the result while it was away.
 func (s *Server) Listen(stream pb.Firestore_ListenServer) error {
 	ctx := stream.Context()
+	var caller map[string]any
+	var expires <-chan time.Time
+	if s.sec != nil {
+		a, exp, err := s.sec.identity(ctx)
+		if err != nil {
+			return err
+		}
+		caller = a
+		if !exp.IsZero() {
+			// An ID token lives an hour. When it lapses the stream ends and the
+			// SDK reconnects with a fresh one, so revocation takes effect.
+			timer := time.NewTimer(time.Until(exp))
+			defer timer.Stop()
+			expires = timer.C
+		}
+	}
 	sub, err := s.hub.subscribe(ctx)
 	if err != nil {
 		return status.Errorf(codes.Unavailable, "kor: listen: %v", err)
@@ -56,7 +73,7 @@ func (s *Server) Listen(stream pb.Firestore_ListenServer) error {
 		}
 	}()
 
-	l := &listener{srv: s, stream: stream, targets: map[int32]*watchTarget{}}
+	l := &listener{srv: s, stream: stream, targets: map[int32]*watchTarget{}, caller: caller}
 	defer func() { listenTargets.Sub(float64(len(l.targets))) }()
 	for {
 		select {
@@ -68,6 +85,8 @@ func (s *Server) Listen(stream pb.Firestore_ListenServer) error {
 			if err := l.apply(ctx, batch); err != nil {
 				return err
 			}
+		case <-expires:
+			return status.Error(codes.Unauthenticated, "ID token expired; reconnect with a fresh one")
 		case <-sub.lost:
 			return status.Error(codes.Unavailable, "kor: listener fell behind the change feed; reconnect to resync")
 		case err := <-recvErr:
@@ -87,6 +106,31 @@ type listener struct {
 	targets  map[int32]*watchTarget
 	lastRead time.Time
 	tokenSeq uint64
+	caller   map[string]any // verified identity on the client endpoint
+}
+
+var errTargetDenied = errors.New("target denied")
+
+// permitted re-checks one document a target is about to deliver.
+func (l *listener) permitted(ctx context.Context, wt *watchTarget, d *store.Doc) bool {
+	sec := l.srv.sec
+	if sec == nil {
+		return true
+	}
+	if wt.q == nil {
+		return sec.canGet(ctx, l.srv.store, l.caller, d.Name, d, rules.NewBudget(10))
+	}
+	return sec.canListDoc(ctx, l.srv.store, l.caller, wt.q, d)
+}
+
+// deny ends one target with PERMISSION_DENIED; the stream and its other
+// targets carry on.
+func (l *listener) deny(id int32) error {
+	l.removeTarget(id)
+	st, _ := status.FromError(errDenied)
+	return l.send(&pb.ListenResponse{ResponseType: &pb.ListenResponse_TargetChange{TargetChange: &pb.TargetChange{
+		TargetChangeType: pb.TargetChange_REMOVE, TargetIds: []int32{id}, Cause: st.Proto(),
+	}}})
 }
 
 // watchTarget is one target's server-side view: what the client currently
@@ -152,6 +196,31 @@ func (l *listener) addTarget(ctx context.Context, pt *pb.Target) error {
 	}
 
 	l.removeTarget(id) // re-adding an id replaces it
+	if sec := l.srv.sec; sec != nil {
+		if wt.q != nil {
+			if sec.checkName(wt.q.Parent) != nil || !sec.canList(ctx, l.srv.store, l.caller, wt.q) {
+				return l.deny(id)
+			}
+		} else {
+			names := make([]string, 0, len(wt.docs))
+			for n := range wt.docs {
+				if sec.checkName(n) != nil {
+					return l.deny(id)
+				}
+				names = append(names, n)
+			}
+			found, err := l.srv.store.GetDocuments(ctx, names)
+			if err != nil {
+				return err
+			}
+			b := rules.NewBudget(20)
+			for _, n := range names {
+				if !sec.canGet(ctx, l.srv.store, l.caller, n, found[n], b) {
+					return l.deny(id)
+				}
+			}
+		}
+	}
 	if err := l.targetChange(pb.TargetChange_ADD, id, nil); err != nil {
 		return err
 	}
@@ -163,6 +232,13 @@ func (l *listener) addTarget(ctx context.Context, pt *pb.Target) error {
 	docs, err := l.current(ctx, wt)
 	if err != nil {
 		return err
+	}
+	if l.srv.sec != nil {
+		for _, d := range docs {
+			if !l.permitted(ctx, wt, d) {
+				return l.deny(id)
+			}
+		}
 	}
 	for _, d := range docs {
 		if err := l.sendDoc(wt, d); err != nil {
@@ -243,7 +319,13 @@ func (l *listener) apply(ctx context.Context, batch []store.Change) error {
 		if wt.rerun {
 			c, err = l.rediff(ctx, wt, docs)
 		} else {
-			c, err = l.judge(wt, ns, docs)
+			c, err = l.judge(ctx, wt, ns, docs)
+		}
+		if errors.Is(err, errTargetDenied) {
+			if err := l.deny(wt.id); err != nil {
+				return err
+			}
+			continue
 		}
 		if err != nil {
 			return err
@@ -257,12 +339,12 @@ func (l *listener) apply(ctx context.Context, batch []store.Change) error {
 }
 
 // judge decides membership from each changed document alone.
-func (l *listener) judge(wt *watchTarget, names []string, docs map[string]*store.Doc) (bool, error) {
+func (l *listener) judge(ctx context.Context, wt *watchTarget, names []string, docs map[string]*store.Doc) (bool, error) {
 	changed := false
 	for _, n := range names {
 		d := docs[n]
 		in := d != nil && (wt.q == nil || (wt.q.Matches(d.Name, d.Fields) && wt.q.InCursorRange(wt.q.OrderKey(d.Name, d.Fields))))
-		c, err := l.reconcile(wt, n, d, in)
+		c, err := l.reconcile(ctx, wt, n, d, in)
 		if err != nil {
 			return false, err
 		}
@@ -283,7 +365,7 @@ func (l *listener) rediff(ctx context.Context, wt *watchTarget, docs map[string]
 	now := make(map[string]bool, len(result))
 	for _, d := range result {
 		now[d.Name] = true
-		c, err := l.reconcile(wt, d.Name, d, true)
+		c, err := l.reconcile(ctx, wt, d.Name, d, true)
 		if err != nil {
 			return false, err
 		}
@@ -297,7 +379,7 @@ func (l *listener) rediff(ctx context.Context, wt *watchTarget, docs map[string]
 		if !inBatch {
 			d = &store.Doc{Name: n} // still exists; it was pushed out of the window
 		}
-		c, err := l.reconcile(wt, n, d, false)
+		c, err := l.reconcile(ctx, wt, n, d, false)
 		if err != nil {
 			return false, err
 		}
@@ -308,10 +390,13 @@ func (l *listener) rediff(ctx context.Context, wt *watchTarget, docs map[string]
 
 // reconcile sends what moves the client from its view to the truth for one
 // document, and reports whether anything was sent.
-func (l *listener) reconcile(wt *watchTarget, name string, d *store.Doc, in bool) (bool, error) {
+func (l *listener) reconcile(ctx context.Context, wt *watchTarget, name string, d *store.Doc, in bool) (bool, error) {
 	old, had := wt.known[name]
 	switch {
 	case in && (!had || !old.Equal(d.UpdateTime)):
+		if !l.permitted(ctx, wt, d) {
+			return false, errTargetDenied
+		}
 		return true, l.sendDoc(wt, d)
 	case !in && had:
 		delete(wt.known, name)

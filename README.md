@@ -37,11 +37,14 @@ for server SDKs and tests, or the SDK's custom-host setting for production use
 Kor also makes a pleasant **persistent local emulator**: unlike the official
 emulator, data survives restarts and lives in a database you can inspect with SQL.
 
-> **Security note:** kord currently has no authentication (like the emulator),
-> so anything that can reach the port has full read/write on every document.
-> It therefore **refuses to start on a non-loopback address** unless you pass
-> `-i-know-this-is-unauthenticated`. Keep it on loopback or a private network.
-> See [SECURITY.md](SECURITY.md).
+> **Security note:** kord serves two endpoints. The main one (`-listen`) is the
+> trusted, admin endpoint, like Firestore's service-account access: anything
+> that can reach it has full read/write, so it **refuses to start on a
+> non-loopback address** unless you pass `-i-know-this-is-unauthenticated`.
+> The **client endpoint** (`-client-listen`) is the one apps connect to: every
+> request is authenticated by its Firebase ID token and decided by your
+> `firestore.rules`, run verbatim. See [docs/security.md](docs/security.md) and
+> [SECURITY.md](SECURITY.md).
 
 ## Why
 
@@ -133,7 +136,7 @@ On the roadmap (in build order):
 | 1 | ~~Composite `index_entries` execution~~, ~~differential fuzzing vs the Google emulator~~ — both shipped |
 | 2 | ~~Change-log~~, ~~functions runtime (runs `firebase-functions` v2 code unchanged)~~, ~~cron scheduler~~ — shipped, see [docs/functions.md](docs/functions.md) |
 | 3 | ~~Realtime: `Listen`/`Write` streams for the native mobile SDKs~~ — shipped, see [docs/realtime.md](docs/realtime.md) |
-| 4 | Security rules interpreter (`firestore.rules` verbatim) + Firebase Auth token verification |
+| 4 | ~~Security rules interpreter (`firestore.rules` verbatim) + Firebase Auth token verification~~ — shipped, see [docs/security.md](docs/security.md) |
 | 5 | WebChannel transport (browser `firebase-js` support) |
 | 6 | Migration tooling: ~~streaming importer~~, ~~verifier~~, ~~reverse export~~ (all shipped, see [docs/cli.md](docs/cli.md)); bidirectional mirror remains |
 

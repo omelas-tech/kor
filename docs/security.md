@@ -1,7 +1,7 @@
 # Security: the client endpoint
 
-kord can serve Firebase client SDKs (iOS, Android, Flutter, and, from phase 5,
-the browser) directly, as Firestore does. Those clients are untrusted: they
+kord can serve Firebase client SDKs (iOS, Android, Flutter and the browser)
+directly, as Firestore does. Those clients are untrusted: they
 connect to the **client endpoint**, where every request is authenticated by
 its Firebase Auth ID token and decided by your `firestore.rules`, run
 verbatim.
@@ -36,6 +36,37 @@ Point the SDKs at that host: Flutter
 iOS `settings.host`, Android `FirebaseFirestoreSettings.Builder().setHost(...)`.
 The SDKs attach the signed-in user's ID token to every call and refresh it on
 their own; nothing else changes in the app.
+
+### Browsers
+
+Browsers cannot speak gRPC. The web SDK uses Firestore's REST API for one-shot
+calls (commit, batchGet, runQuery, aggregations, transactions) and WebChannel
+for the Listen and Write streams. `-client-web-listen` serves both, as plain
+HTTP on loopback behind the same TLS proxy:
+
+```bash
+kord ... -client-listen 127.0.0.1:6567 \
+  -client-web-listen 127.0.0.1:6568 -client-web-origins https://example.com
+```
+
+```caddy
+firestore.example.com {
+  @web path /v1/* /google.firestore.v1.Firestore/*/channel*
+  reverse_proxy @web 127.0.0.1:6568 { flush_interval -1 }
+  reverse_proxy h2c://127.0.0.1:6567
+}
+```
+
+The browser transports hold no authority. Each request is forwarded to the
+client endpoint as a gRPC call carrying the caller's ID token, so
+authentication and rules are identical to the native SDKs'. Only the listed
+origins pass CORS; it is a browser courtesy, not the security boundary (a
+script outside a browser can send any Origin, and still needs a valid token).
+In the web app:
+`initializeFirestore(app, { host: 'firestore.example.com', ssl: true })`.
+
+Serve it over HTTP/2 (any TLS proxy does). Every open listener holds a
+request, and over HTTP/1.1 browsers allow six per host.
 
 The client endpoint serves one project. Requests naming another project are
 refused, and an ID token is only accepted for the project it was issued for.
@@ -131,6 +162,11 @@ denied, as on Firestore.
 - End-to-end tests with the official Go SDK against a client endpoint:
   reads, queries, aggregations, batches, transactions, listeners losing
   access, bad tokens.
+- `e2e/js/browser.sh`: the unmodified firebase-js web SDK in headless
+  Chromium, cross-origin, against `-client-web-listen` with rules on, in both
+  streaming and forced long-polling mode: listeners, writes, non-ASCII data
+  through the channel framing, server gets and queries, count aggregation,
+  transactions, batches and rule denials.
 - `TestRulesDifferential` loads the same ruleset into Google's Firestore
   emulator and kord, seeds the same documents, and has random users run
   random reads, writes, near-miss mutations and queries against both.

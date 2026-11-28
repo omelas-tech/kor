@@ -85,6 +85,12 @@ func (sec *security) identity(ctx context.Context) (map[string]any, time.Time, e
 			exp = time.Unix(e, 0)
 		}
 	}
+	// Emulator-style unsigned tokens carry exp 3600 (1970) and Verify skips
+	// the expiry check for them; arming the stream timer on it would end
+	// every stream at once.
+	if sec.verifier.Unsigned() && !exp.IsZero() && exp.Before(time.Now()) {
+		exp = time.Time{}
+	}
 	return a, exp, nil
 }
 

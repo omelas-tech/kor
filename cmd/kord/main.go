@@ -12,13 +12,17 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
+	firestorepb "cloud.google.com/go/firestore/apiv1/firestorepb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
 
 	"github.com/omelas-tech/kor/internal/auth"
@@ -26,6 +30,7 @@ import (
 	"github.com/omelas-tech/kor/internal/rpc"
 	"github.com/omelas-tech/kor/internal/rules"
 	"github.com/omelas-tech/kor/internal/store"
+	"github.com/omelas-tech/kor/internal/web"
 )
 
 // indexReloadInterval trades staleness for load. Index changes are rare and
@@ -46,6 +51,10 @@ func main() {
 	project := flag.String("project", os.Getenv("KORD_PROJECT"), "Firebase project id whose ID tokens the client endpoint accepts")
 	tlsCert := flag.String("client-tls-cert", os.Getenv("KORD_CLIENT_TLS_CERT"), "TLS certificate for the client endpoint")
 	tlsKey := flag.String("client-tls-key", os.Getenv("KORD_CLIENT_TLS_KEY"), "TLS key for the client endpoint")
+	webListen := flag.String("client-web-listen", os.Getenv("KORD_CLIENT_WEB_LISTEN"),
+		"address for the browser transports (Firestore REST + WebChannel), HTTP/1.1 on loopback behind a TLS proxy. Forwards to -client-listen. Empty = disabled")
+	webOrigins := flag.String("client-web-origins", os.Getenv("KORD_CLIENT_WEB_ORIGINS"),
+		"comma-separated browser origins allowed to call -client-web-listen (e.g. https://example.com)")
 	unsigned := flag.Bool("accept-unsigned-test-tokens", false,
 		"TESTS ONLY: accept unsigned (alg none) ID tokens, as the Firebase emulators issue. Anyone can then act as any user. Requires a loopback -client-listen")
 	flag.Parse()
@@ -145,6 +154,17 @@ func main() {
 			os.Exit(2)
 		}
 		defer stopClient()
+		if *webListen != "" {
+			stopWeb, err := serveWeb(log, *webListen, *clientListen, *tlsCert != "", *webOrigins)
+			if err != nil {
+				log.Error("refusing to start the browser transports", "err", err)
+				os.Exit(2)
+			}
+			defer stopWeb()
+		}
+	} else if *webListen != "" {
+		log.Error("-client-web-listen needs -client-listen")
+		os.Exit(2)
 	}
 	rpc.StartStatsReporter(ctx, log, time.Minute)
 	if *metricsAddr != "" {
@@ -309,4 +329,46 @@ func loadRules(path string) (*rules.Ruleset, time.Time, error) {
 		return nil, time.Time{}, err
 	}
 	return rs, fi.ModTime(), nil
+}
+
+// serveWeb runs the browser transports. They hold no authority of their own:
+// every request becomes a gRPC call on the client endpoint carrying the
+// caller's ID token, so rules and authentication are exactly the SDKs'.
+func serveWeb(log *slog.Logger, addr, clientAddr string, clientTLS bool, origins string) (func(), error) {
+	if err := requireLoopback(addr); err != nil {
+		return nil, fmt.Errorf("-client-web-listen speaks plain HTTP; keep it on loopback behind a TLS proxy: %w", err)
+	}
+	if clientTLS {
+		return nil, fmt.Errorf("-client-web-listen forwards over loopback and needs a plain -client-listen (terminate TLS in the proxy)")
+	}
+	var list []string
+	for _, o := range strings.Split(origins, ",") {
+		if o = strings.TrimSpace(o); o != "" {
+			list = append(list, o)
+		}
+	}
+	if len(list) == 0 {
+		return nil, fmt.Errorf("-client-web-origins is empty: no browser could call it")
+	}
+	conn, err := grpc.NewClient(clientAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return nil, err
+	}
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           web.Handler(firestorepb.NewFirestoreClient(conn), web.Options{Origins: list, Log: log}),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	lis, err := net.Listen("tcp", addr)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	go func() {
+		if err := srv.Serve(lis); err != nil && err != http.ErrServerClosed {
+			log.Error("browser transports", "err", err)
+		}
+	}()
+	log.Info("browser transports serving", "addr", lis.Addr().String(), "forward_to", clientAddr, "origins", list)
+	return func() { srv.Close(); conn.Close() }, nil
 }

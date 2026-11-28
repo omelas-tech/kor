@@ -4,6 +4,7 @@
 //	kor import -collection my_collection -project my-project -kor 127.0.0.1:6565 [-creds sa.json]
 //	kor export -collection my_collection -project my-project -kor 127.0.0.1:6565 [-creds sa.json] [-dry-run] [-rate 400]
 //	kor verify -collection my_collection -project my-project -kor 127.0.0.1:6565 [-creds sa.json] [-sample 0]
+//	kor mirror -project my-project -roots chats,comments -groups chats,messages,comments -state mirror.cursor
 //	kor bench  -collection my_collection -project my-project -pg-dsn postgres://... [-n 300]
 //	kor stats  -pg-dsn postgres://...
 package main
@@ -47,13 +48,15 @@ func main() {
 		runIndex(os.Args[2:])
 	case "bench":
 		runBench(os.Args[2:])
+	case "mirror":
+		runMirror(os.Args[2:])
 	default:
 		usage()
 	}
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: kor <import|export|verify|stats|bench|index|drop> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: kor <import|export|verify|mirror|stats|bench|index|drop> [flags]")
 	os.Exit(2)
 }
 
